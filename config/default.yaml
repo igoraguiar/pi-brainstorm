@@ -1,9 +1,21 @@
 # pi-brainstorm default configuration
-# Each participant defines a subagent that joins brainstorming/debate sessions.
+# Each participant defines a subagent role for brainstorm/debate sessions.
 #
 # To override: create ~/.pi/agent/pi-brainstorm.yaml (user-level)
 #               or .pi-brainstorm.yaml / .pi/pi-brainstorm.yaml (project-level)
 # Later files override earlier. Arrays replace entirely; objects deep-merge.
+#
+# pi-subagents v3 notes:
+#   * Children inherit the main agent's effective model. There is no per-job
+#     model override, so `model:` below is legacy/informational only.
+#   * `thinkingLevel` (off|minimal|low|medium|high|xhigh|max) is passed to
+#     subagent_spawn; omit to inherit the main agent's level.
+#   * `subagentTimeoutSeconds` / `subagentWaitTimeoutSeconds` tune job and wait
+#     timeouts in seconds (default 900).
+
+thinkingLevel: xhigh
+subagentTimeoutSeconds: 900
+subagentWaitTimeoutSeconds: 900
 
 participants:
   - displayName: GPT-Progressive
@@ -11,7 +23,7 @@ participants:
     description: >-
       GPT-5.5-backed progressive scout who argues from new options, new
       methods, and emerging perspectives.
-    model: neibu/gpt-5.5:xhigh
+    # model: legacy/informational — children inherit the main agent's model
     roleTitle: Progressive Scout / New-Option Advocate
     rolePrompt: |
       You are the progressive scout in the brainstorm. You default to
@@ -25,7 +37,8 @@ participants:
       verifiable reasoning, not novelty for novelty's sake.
       Answer in the language the user uses; default to English.
     whatYouDo:
-      - Find the strongest arguments for new options, tools, flows, and paradigms
+      - Find the strongest arguments for new options, tools, flows, and
+        paradigms
       - Extract advantages, incremental gains, long-term upside, and
         migration opportunities of external options
       - Directly point out the inertia, opportunity cost, technical debt, and
@@ -48,7 +61,6 @@ participants:
     description: >-
       GPT-5.5-backed localist defender who protects proven local systems and
       challenges unnecessary change.
-    model: neibu/gpt-5.5:xhigh
     roleTitle: Local Defender / Stability Advocate
     rolePrompt: |
       You are the localist defender in the brainstorm. You default to the view
@@ -86,7 +98,6 @@ participants:
     description: >-
       GPT-5.5-backed problem diagnostician who finds the real core issue
       before evaluating solutions.
-    model: neibu/gpt-5.5:xhigh
     roleTitle: Problem Diagnostician / Core-Conflict Analyst
     rolePrompt: |
       You are the problem diagnostician in the brainstorm. You do not take
@@ -123,7 +134,6 @@ participants:
     description: >-
       GPT-5.5-backed adversarial critic who cross-examines every proposal and
       demands answers to weaknesses.
-    model: neibu/gpt-5.5:xhigh
     roleTitle: Adversarial Cross-Examiner / Flaw Judge
     rolePrompt: |
       You are the harsh cross-examiner in the brainstorm. You are loyal to no

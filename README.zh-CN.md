@@ -2,7 +2,7 @@
 
 面向 [pi](https://github.com/earendil-works/pi-coding-agent) 的多 Agent 头脑风暴与辩论插件。
 
-`pi-brainstorm` 让不同身份和提示词设定的 Agent 参与同一场讨论。随包提供的默认 Agent 全部使用 `neibu/gpt-5.5:xhigh`，差异来自角色视角，而不是底层模型。使用 `/brainstorm` 启动结构化讨论，使用 `/debate` 启动对抗辩论。
+`pi-brainstorm` 让不同身份和提示词设定的 Agent 参与同一场讨论。差异来自角色视角，而不是底层模型。使用 `/brainstorm` 启动结构化讨论，使用 `/debate` 启动对抗辩论。
 
 插件会把每个参与者的完整发言保存在 `.pi-meetings/...` 下的本地会议黑板中。黑板是实现亮点，不是主要卖点：它让主会话保持简洁，只展示短卡片、主持人总结、共识、分歧和最终结论，同时完整 transcript 仍然保存在磁盘上。
 
@@ -10,13 +10,13 @@ English README: [README.md](./README.md).
 
 ## 功能
 
-- 多 Agent 头脑风暴：默认身份为 GPT-Progressive（追新探索者）、GPT-Localist（本地守成者）、GPT-Diagnostician（问题诊断者）、GPT-Critic（严苛质询者），底层统一使用 `neibu/gpt-5.5:xhigh`。
+- 多 Agent 头脑风暴：默认身份为 GPT-Progressive（追新探索者）、GPT-Localist（本地守成者）、GPT-Diagnostician（问题诊断者）、GPT-Critic（严苛质询者），每个参与者作为一个 subagent 任务运行，使用各自的角色提示词。
 - 辩论 / battle 模式：Agent 会攻击、审视、反驳彼此的观点。
 - 配置驱动：通过 YAML 添加、删除或自定义参与者。
 - 参与者完整发言以 Markdown 文件保存到 `.pi-meetings/`。
 - 主会话中展示紧凑发言卡片，而不是粘贴长篇 transcript。
 - 使用 JSONL 索引作为轻量级跨轮上下文入口。
-- 由配置自动生成托管的 agent 文件——更新一个 YAML，所有 agent 同步。
+- 基于 `@narumitw/pi-subagents` v3（`subagent_spawn` / `subagent_wait`）。
 
 ## 安装
 
@@ -62,8 +62,7 @@ pi install /Users/jarcis/Project/pi-brainstorm
 participants:
   - displayName: GPT-Analyst
     agentName: gpt-analyst-brainstormer
-    description: GPT-5.5 头脑风暴顾问。细致入微的分析师，用于多 Agent 讨论。
-    model: neibu/gpt-5.5:xhigh
+    description: 细致入微的分析师，用于多 Agent 讨论。
     roleTitle: 细致分析师
     rolePrompt: |
       你是多 Agent 头脑风暴中的分析顾问。擅长细致入微的论证和长篇分析。用中文回答。
@@ -76,38 +75,47 @@ participants:
       prompt: |
         DEBATE MODE. You are THE ANALYST. Dissect every argument with precision. Find the weakest link in every chain of reasoning. Use Chinese.
     brainstormRole: 细致分析师
+    # 可选：每个参与者的思考等级与执行超时
+    # thinkingLevel: xhigh
+    # timeoutSeconds: 900
 ```
 
 如需完全替换默认参与者，在覆盖文件中定义完整的 `participants` 列表即可。
 
+顶层还支持以下选项：
 
-用户级配置可以在确认后创建或更新 `~/.pi/agent/agents/` 下的受管理 agent 文件。项目级配置只影响当前会话编排，但不会自动写入全局 agent 文件；如果需要自动同步 agent，请手动创建对应 agent，或把配置移到 `~/.pi/agent/pi-brainstorm.yaml`。
+- `thinkingLevel` — 传给 `subagent_spawn` 的默认思考等级（`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）。省略则继承主 Agent 的等级。
+- `subagentTimeoutSeconds` — 任务执行超时（秒，默认 `900`）。
+- `subagentWaitTimeoutSeconds` — `subagent_wait` 等待超时（秒，默认 `900`）。
+- `extensionPath` — 覆盖附加给子 Agent 的 pi-brainstorm 扩展路径（高级选项）。
 
-### 托管的 Agent 文件
+> 旧字段 `model:` 仍可加载但会被忽略：pi-subagents v3 的子 Agent 始终继承主 Agent 的模型。
 
-由 pi-brainstorm 生成的 agent 文件包含 `<!-- managed-by: pi-brainstorm -->` 标记。当配置变更时，这些文件会被覆盖。不含此标记的已有 agent 文件永远不会被修改。
+### Subagent 运行时
+
+`pi-brainstorm` 不再生成 agent 文件。参与者的角色文本会注入到 `subagent_spawn` 的 task 中，子 Agent 通过附加本扩展获得黑板工具。`~/.pi/agent/agents/` 下无需安装任何内容；之前生成的 `*-brainstormer.md` 文件可以删除。
 
 ## 前置条件
 
-`pi-brainstorm` 通过 Pi 的 `subagent` 工具来调用各个参与者。使用 `/brainstorm` 或 `/debate` 前，请先单独安装提供 `subagent` 工具的包：
+`pi-brainstorm` 通过 `@narumitw/pi-subagents` **v3** 编排参与者，该包注册 `subagent_spawn` / `subagent_wait` 工具。使用 `/brainstorm` 或 `/debate` 前，请先单独安装：
 
 ```bash
 pi install npm:@narumitw/pi-subagents
 ```
 
-`@narumitw/pi-subagents` 会注册 `subagent` 工具，让 `pi-brainstorm` 能把参与者作为隔离的 Pi 子进程运行。它是运行时前置条件，不随 `pi-brainstorm` 打包。
+`@narumitw/pi-subagents` 会把每个参与者任务作为隔离的 Pi 子进程运行。它是运行时前置条件，不随 `pi-brainstorm` 打包。
 
-作为参考，Pi coding-agent 发行包中也包含一个 example implementation，通常位于：
+v3 运行时**没有 `subagent` 工具，也没有具名 Agent 目录**。因此 `pi-brainstorm` 改为使用自包含任务进行委派：参与者角色文本来自你的 YAML 配置，子 Agent 通过附加本扩展获得黑板工具。
 
-```text
-/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/
-```
+影响 `pi-brainstorm` 工作方式的 v3 行为：
 
-命令处理器会先创建本地会议记录，然后通过 `subagent` 调用配置中的参与者。默认通用 Agent 文件统一使用 `gpt-progressive-brainstormer`、`gpt-localist-brainstormer`、`gpt-diagnostician-brainstormer`、`gpt-critic-brainstormer`。所有默认身份的底层模型均为 `neibu/gpt-5.5:xhigh`。
+- `subagent_spawn({ task, tools, extensions, thinkingLevel?, timeout? })` 立即返回 `jobId`，任务在后台运行；用 `subagent_wait({ jobId })` 等待结果。
+- 终态为 `completed`、`partial`、`failed`、`timed_out`、`cancelled`。
+- 子 Agent 继承主 Agent 的模型。**没有按任务指定模型的覆盖能力**；请用 YAML 定义角色，而不是为每个参与者选择底层模型。
+- 子 Agent **不会**继承主 Agent 的扩展工具。`pi-brainstorm` 会附加自身扩展，并且只暴露 `meeting_append_entry`、`meeting_read_index`、`meeting_read_entry`。
+- 超时单位为**秒**（旧的 `PI_SUBAGENT_TIMEOUT_MS` 环境变量不再适用）。参与者全文应写入 `.pi-meetings/...`，主会话只应看到短的 `WROTE_ENTRY` 摘要和主持人综合。
 
-第一次使用时，如果这些用户级 agent 不存在，扩展会询问是否写入内置默认定义。已有同名且不含托管标记的文件不会被覆盖。
-
-`@narumitw/pi-subagents` 对每个子进程有 hard timeout。未设置 `timeoutMs` 时，会使用环境变量 `PI_SUBAGENT_TIMEOUT_MS`；如果环境变量也没设置，默认是 `600000` 毫秒（10 分钟）。子 agent 输出很长本身不会被判定为 timeout，但生成超长输出会增加运行时间，如果超过这个 wall-clock timeout，就会被 `subagent` 工具标记为超时。参与者全文应写入 `.pi-meetings/...`，主会话只应看到短的 `WROTE_ENTRY` 摘要和主持人综合。
+项目本地安装的场景下，附加扩展在子进程中加载可能需要项目信任（project trust）。
 
 ## 命令
 
@@ -124,8 +132,9 @@ pi install npm:@narumitw/pi-subagents
 ## 工作方式
 
 ```text
-参与者模型 -> meeting_append_entry -> .pi-meetings/... 文件
-参与者模型 -> 短 WROTE_ENTRY 摘要 -> 主持人上下文
+主持人 -> subagent_spawn(task) -> 子 Agent 通过 meeting_* 工具读写黑板
+子 Agent -> meeting_append_entry -> .pi-meetings/... 文件
+子 Agent -> 短 WROTE_ENTRY 摘要 -> subagent_wait 结果 -> 主持人上下文
 文件 watcher -> 短卡片 -> 主会话可见区域
 主持人 -> 每轮 checkpoint / 共识 / 分歧 / 最终综合
 ```
@@ -134,12 +143,15 @@ pi install npm:@narumitw/pi-subagents
 
 ## 工具
 
-扩展注册四个工具：
+扩展注册一整套黑板工具：
 
 - `meeting_rename`（仅主持人）：在 Round 1 开始前将会议目录重命名为人类可读的标题。
 - `meeting_append_entry`：把参与者完整发言写入磁盘，只返回短引用。
 - `meeting_read_index`：读取条目索引，包含 id、speaker、phase、summary、path。
 - `meeting_read_entry`：在主持人或参与者需要时读取某条完整发言。
+- `meeting_append_artifact`、`meeting_append_edge`、`meeting_read_artifacts`、`meeting_get_state`、`meeting_update_state`、`meeting_log_event`：支撑 v2 lab 模式（artifact / edge / state 跟踪）。
+
+会话中的子 Agent 只通过附加扩展获得 `meeting_append_entry`、`meeting_read_index`、`meeting_read_entry`，其余工具保留在主持人的主 Agent 中。
 
 ## 文件结构
 
@@ -160,6 +172,17 @@ pi install npm:@narumitw/pi-subagents
 ## 安全边界
 
 扩展会校验会议路径必须留在当前工作区的 `.pi-meetings/` 下，并拒绝符号链接形式的会议目录、entry 文件、index 文件和 blackboard 文件。entry 写入使用 exclusive creation，避免覆盖已有文件。
+
+## 从 2.x 迁移
+
+`pi-brainstorm` v0.6 面向 `@narumitw/pi-subagents` **v3**。如果你从 2.x 升级，请注意 v3 移除了 `subagent` 工具、具名 Agent 目录、按任务指定模型以及自定义系统提示词。`pi-brainstorm` 已相应更新：
+
+- 编排改用 `subagent_spawn` + `subagent_wait`，不再使用 `subagent`。
+- 参与者角色文本注入 spawn task；生成的 agent 文件已移除。
+- 子 Agent 通过 `extensions: [{ path, tools }]` 获得黑板工具。
+- 参与者配置中的 `model:` 会被忽略；请用 `thinkingLevel` 控制推理深度。
+
+升级后请开启新的 Pi 会话，避免残留的工具调用仍请求已移除的工具名。
 
 ## 开发
 
