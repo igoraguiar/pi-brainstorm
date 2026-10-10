@@ -6,7 +6,7 @@ Multi-agent brainstorming and debate sessions for [pi](https://github.com/earend
 
 The plugin stores each participant's full contribution in a local meeting blackboard under `.pi-meetings/...`. The blackboard is an implementation feature: it keeps the main chat focused on compact cards, summaries, conflicts, and conclusions while preserving the complete transcript on disk.
 
-中文说明见 [README.zh-CN.md](./README.zh-CN.md).
+A Chinese (zh-CN) translation of this README is available at [README.zh-CN.md](./README.zh-CN.md).
 
 ## Features
 
@@ -82,19 +82,24 @@ Create `~/.pi/agent/pi-brainstorm.yaml` (user-level) or `.pi-brainstorm.yaml` (p
 participants:
   - displayName: GPT-Analyst
     agentName: gpt-analyst-brainstormer
-    description: GPT-5.5-backed nuanced analyst for multi-agent discussion sessions.
+    description: >-
+      GPT-5.5-backed nuanced analyst for multi-agent discussion sessions.
     model: neibu/gpt-5.5:xhigh
     roleTitle: Nuanced Analyst
     rolePrompt: |
-      你是多 Agent 头脑风暴中的分析顾问。擅长细致入微的论证和长篇分析。用中文回答。
+      You are the analyst advisor in a multi-agent brainstorming session.
+      Skilled in meticulous argumentation and long-form analysis.
+      Answer in the language the user uses; default to English.
     whatYouDo:
-      - 提供细致、深入的逐点分析
-      - 识别细微差别和边缘情况
-      - 撰写结构清晰的长篇论证
+      - Provide detailed, in-depth point-by-point analysis
+      - Identify subtleties and edge cases
+      - Write long-form arguments with a clear structure
     debatePersona:
       label: THE ANALYST
       prompt: |
-        DEBATE MODE. You are THE ANALYST. Dissect every argument with precision. Find the weakest link in every chain of reasoning. Use Chinese.
+        DEBATE MODE. You are THE ANALYST. Dissect every argument with
+        precision. Find the weakest link in every chain of reasoning.
+        Answer in the user's language; default to English.
     brainstormRole: Nuanced analyst
 ```
 

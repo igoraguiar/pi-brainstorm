@@ -474,7 +474,7 @@ function generateAgentFile(participant: ParticipantConfig): string {
 
   const whatYouDoLines = (participant.whatYouDo && participant.whatYouDo.length > 0)
     ? participant.whatYouDo.map((item) => `- ${item}`).join("\n")
-    : `- 参与多 Agent 讨论并提供${participant.displayName}视角的分析`;
+    : `- Join the multi-model discussion and provide a ${participant.displayName} perspective`;
 
   return [
     "---",
@@ -494,9 +494,11 @@ function generateAgentFile(participant: ParticipantConfig): string {
     whatYouDoLines,
     "",
     "## What You Do Not Do",
-    "- 写代码或修改项目文件，你只读项目文件",
-    "- 委派给其他 Agent",
-    "- 在聊天中直接粘贴长篇分析；当明确指示使用 meeting_append_entry 时，必须将完整贡献写入会议黑板，最终回复仅写 WROTE_ENTRY + 一句话摘要",
+    "- Never write code or modify project files; you only read them",
+    "- Never delegate to other agents",
+    "- Never paste long analyses into chat; when told to use " +
+      "meeting_append_entry, write your FULL contribution to the meeting " +
+      "blackboard and reply only with WROTE_ENTRY plus a one-sentence summary",
     "",
     "## Worker Preamble",
     "You are a terminal worker. Work directly with tools. Do NOT spawn sub-agents.",
@@ -718,7 +720,7 @@ function buildBrainstormPrompt(
     agentTaskLines,
     '   - phase: "Round 1", "Round 2", or "Round 3"',
     "   - summary: a ONE-SENTENCE summary of your contribution",
-    "   - content: your FULL analysis in Chinese (中文)",
+    "   - content: your FULL analysis (in the user's language, default English)",
     "   - content must contain only the participant's analysis. Do not include wrapper tags, hidden thinking markers, tool-call text, or WROTE_ENTRY text inside content.",
     "3. After writing, your FINAL ANSWER must be ONLY:",
     "   `WROTE_ENTRY: <your one-sentence summary>`",
@@ -762,9 +764,12 @@ function buildBrainstormPrompt(
     "### When a consultant is UNAVAILABLE",
     "- Do NOT wait indefinitely or freeze the session",
     "- Proceed with the remaining consultants who succeeded",
-    "- In your structural overview, clearly mark the failed participant as: \"[displayName] ([agentName]): 本轮未响应 / did not respond\"",
+    "- In your structural overview, clearly mark the failed participant as: " +
+      "\"[displayName] ([agentName]): did not respond\"",
     "- Continue to the next round normally — do NOT skip the consultant in future rounds (they may recover)",
-    "- If the same consultant fails in 2 consecutive rounds, warn the user with the real display name, e.g.: \"GPT-Critic 连续两轮失败，建议检查该角色是否可用\"",
+    "- If the same consultant fails in 2 consecutive rounds, warn the user " +
+      "with the real display name, e.g.: \"GPT-Critic failed in 2 " +
+      "consecutive rounds; check whether that model is available\"",
     "",
     "### NEVER do this",
     "- Do NOT fabricate or simulate a consultant's response",
@@ -772,7 +777,7 @@ function buildBrainstormPrompt(
     "- Do NOT abort the entire session because one consultant failed",
     "",
     "## IMPORTANT",
-    "- All responses in Chinese (中文).",
+    "- Respond in the language the user uses; default to English.",
     "- Save transcript.md and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
     "- The user can intervene at any time to steer the discussion.",
   ].join("\n");
@@ -854,7 +859,7 @@ function buildDebatePrompt(
     agentTaskLines,
     '   - phase: "Cycle 1", "Cycle 2", etc.',
     "   - summary: a ONE-SENTENCE summary of your argument",
-    "   - content: your FULL argument in Chinese (中文)",
+    "   - content: your FULL argument (in the user's language, default English)",
     "3. After writing, your FINAL ANSWER must be ONLY:",
     "   `WROTE_ENTRY: <your one-sentence summary>`",
     "4. DO NOT paste your full argument into the chat.",
@@ -893,9 +898,12 @@ function buildDebatePrompt(
     "### When a debater is UNAVAILABLE",
     "- Do NOT wait indefinitely or freeze the session",
     "- Skip to the next debater in the cycle",
-    "- In your structural overview, clearly mark the failed participant as: \"[displayName] ([agentName]): 本轮未响应 / did not respond\"",
+    "- In your structural overview, clearly mark the failed participant as: " +
+      "\"[displayName] ([agentName]): did not respond\"",
     "- Continue the debate with remaining debaters — do NOT abort the whole debate",
-    "- If the same debater fails in 2 consecutive cycles, warn the user with the real display name, e.g.: \"GPT-Critic 连续两轮失败，建议检查该角色是否可用\"",
+    "- If the same debater fails in 2 consecutive cycles, warn the user " +
+      "with the real display name, e.g.: \"GPT-Critic failed in 2 " +
+      "consecutive cycles; check whether that model is available\"",
     "",
     "### NEVER do this",
     "- Do NOT fabricate or simulate a debater's argument",
@@ -905,7 +913,7 @@ function buildDebatePrompt(
     "",
     "## Rules",
     "- NEVER stop at a predetermined count. Only convergence or user intervention ends this debate.",
-    "- All responses in Chinese (中文).",
+    "- Respond in the language the user uses; default to English.",
     "- After convergence, save transcript.md immediately and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
     "- Present: (1) the debate arc, (2) who conceded what, (3) final synthesis.",
   ].join("\n");
@@ -1055,12 +1063,13 @@ function buildBrainstormLabPrompt(
     "",
     "Detect failures: error text, empty output, no WROTE_ENTRY, no meeting_append_entry call.",
     "Retry: wait 5-10s, retry up to 2 more times (3 total). On retry: \"PREVIOUS ATTEMPT FAILED. This is retry N of 2.\"",
-    "If unavailable: mark as \"[displayName] ([agentName]): 本轮未响应\", continue with remaining participants.",
+    "If unavailable: mark as \"[displayName] ([agentName]): " +
+      "did not respond\", continue with remaining participants.",
     "If same participant fails 2 consecutive rounds, warn user.",
     "NEVER fabricate responses. NEVER abort session for one failure.",
     "",
     "## IMPORTANT",
-    "- All responses in Chinese (中文).",
+    "- Respond in the language the user uses; default to English.",
     "- Save transcript.md and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
     "- The user can intervene at any time to steer the discussion.",
     "- Legacy /brainstorm and /debate remain available as escape hatches.",
