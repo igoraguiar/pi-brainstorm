@@ -13,6 +13,9 @@
  * - meeting_read_entry tool — read full entry content
  * - /brainstorm command — multi-agent brainstorming
  * - /debate command — open-ended multi-agent debate
+ * - /brainstorm-lab command — v2 lab mode (artifacts/edges/state)
+ * - /brainstorm-from-file, /debate-from-file — run a session from a YAML file
+ *   (topic + participant agent names)
  * - meeting-entry message renderer — compact cards with expandable content
  * - File watcher — auto-posts new entries into the main conversation
  * - Managed agent file generation from config
@@ -1497,6 +1500,300 @@ async function getEntryCount(absDir: string): Promise<number> {
 }
 
 // ────────────────────────────────────────────────────────
+// Session start (shared by all commands)
+// ────────────────────────────────────────────────────────
+
+type SessionKind = "brainstorm" | "debate" | "lab";
+
+interface SessionFile {
+  topic: string;
+  participants: string[];
+}
+
+/** Strip a single pair of surrounding quotes from a CLI argument. */
+function cleanArg(raw: string): string {
+  let s = raw.trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1);
+  }
+  return s.trim();
+}
+
+/**
+ * Load a session file (YAML) containing a topic and a list of participant
+ * agent names. The path is resolved relative to cwd (absolute allowed).
+ */
+function loadSessionFile(cwd: string, fileArg: string): SessionFile {
+  const resolved = path.resolve(cwd, fileArg);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Session file not found: ${resolved}`);
+  }
+  assertExistingFileNoSymlink(resolved, "session file");
+
+  let parsed: any;
+  try {
+    parsed = YAML.parse(fs.readFileSync(resolved, "utf-8"));
+  } catch (err: any) {
+    throw new Error(`Failed to parse ${resolved}: ${err.message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Session file ${resolved} must be a YAML mapping.`);
+  }
+
+  const topic = parsed.topic;
+  if (typeof topic !== "string" || !topic.trim()) {
+    throw new Error(
+      `Session file ${resolved} must define a non-empty "topic".`
+    );
+  }
+
+  const list = parsed.participants;
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error(
+      `Session file ${resolved} must define a non-empty ` +
+        `"participants" array.`
+    );
+  }
+
+  const names: string[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (typeof item !== "string" || !item.trim()) {
+      throw new Error(
+        `Session file ${resolved} participant at index ${i} ` +
+          `must be a non-empty string.`
+      );
+    }
+    names.push(item.trim());
+  }
+
+  return { topic: topic.trim(), participants: names };
+}
+
+/**
+ * Select the configured participants matching the given agent names,
+ * preserving the order in which they were listed. Throws if any name is
+ * unknown, so typos fail loudly instead of silently dropping a participant.
+ */
+function selectParticipants(
+  all: ParticipantConfig[],
+  agentNames: string[]
+): ParticipantConfig[] {
+  const byName = new Map(all.map((p) => [p.agentName, p]));
+  const selected: ParticipantConfig[] = [];
+  const seen = new Set<string>();
+  const missing: string[] = [];
+
+  for (const name of agentNames) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const match = byName.get(name);
+    if (match) {
+      selected.push(match);
+    } else {
+      missing.push(name);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Unknown participant agent name(s): ${missing.join(", ")}. ` +
+        `Available: ${all.map((p) => p.agentName).join(", ")}`
+    );
+  }
+  return selected;
+}
+
+/**
+ * Resolve configured participants (optionally filtered to a subset),
+ * ensure their agent files exist, and return the ready list.
+ * Notifies the user and returns null on any error.
+ */
+async function prepareParticipants(
+  ctx: any,
+  selector?: string[]
+): Promise<ParticipantConfig[] | null> {
+  let all: ParticipantConfig[];
+  try {
+    all = resolveParticipants(ctx.cwd);
+  } catch (err: any) {
+    ctx.ui.notify(`pi-brainstorm config error: ${err.message}`, "error");
+    return null;
+  }
+
+  let participants = all;
+  if (selector) {
+    try {
+      participants = selectParticipants(all, selector);
+    } catch (err: any) {
+      ctx.ui.notify(`pi-brainstorm session error: ${err.message}`, "error");
+      return null;
+    }
+  }
+
+  const agentsReady = await ensureAgentsFromConfig(ctx, participants, {
+    allowGlobalWrites: !hasProjectConfig(ctx.cwd),
+  });
+  if (!agentsReady) return null;
+
+  return participants;
+}
+
+/**
+ * Create the meeting folder, seed its files, start the watcher, and hand
+ * the orchestration prompt to the main agent.
+ */
+async function startSession(
+  pi: ExtensionAPI,
+  ctx: any,
+  kind: SessionKind,
+  topic: string,
+  participants: ParticipantConfig[]
+): Promise<void> {
+  // Lab sessions reuse the brainstorm folder-name prefix.
+  const folderKind: "brainstorm" | "debate" =
+    kind === "debate" ? "debate" : "brainstorm";
+
+  let absDir: string;
+  let meetingName: string;
+  try {
+    ({ absDir, meetingName } = await createUniqueMeetingDir(
+      ctx.cwd,
+      initialMeetingName(folderKind)
+    ));
+  } catch (err: any) {
+    ctx.ui.notify(`Failed to create meeting folder: ${err.message}`, "error");
+    return;
+  }
+
+  assertDirectoryNoSymlink(absDir, "meeting directory");
+  assertDirectoryNoSymlink(path.join(absDir, "entries"), "entries directory");
+
+  // Kind-specific seeding.
+  let blackboardHeader: string[];
+  let notifyText: string;
+  let promptText: string;
+
+  if (kind === "lab") {
+    const viewsDir = path.join(absDir, "views");
+    await fsp.mkdir(viewsDir, { recursive: true });
+    assertDirectoryNoSymlink(viewsDir, "views directory");
+    await seedLabMeeting(absDir, topic, participants);
+
+    blackboardHeader = [
+      `# Lab: ${topic}`,
+      `> Mode: brainstorm-lab v2`,
+      `> Created: ${new Date().toISOString()}`,
+      `> Artifact tracking: enabled`,
+      `> Edges: enabled`,
+      `> State management: events + state.json`,
+      "",
+      "---",
+      "",
+    ];
+    notifyText =
+      `🧪 Brainstorm Lab: ${meetingName}\n` +
+      `  Folder: .pi-meetings/${meetingName}\n` +
+      `  Artifact tracking + edges + state management active`;
+    promptText = buildBrainstormLabPrompt(topic, absDir, participants);
+  } else {
+    const isBrainstorm = kind === "brainstorm";
+    blackboardHeader = [
+      `# ${isBrainstorm ? "Meeting" : "Debate"}: ${topic}`,
+      `> Created: ${new Date().toISOString()}`,
+      `> Type: ${
+        isBrainstorm
+          ? "Brainstorming (3 rounds)"
+          : "Open-ended debate (until convergence)"
+      }`,
+      "",
+      "---",
+      "",
+    ];
+    notifyText =
+      `${
+        isBrainstorm ? "🧠 Multi-agent brainstorm" : "⚔️ Multi-agent debate"
+      }: ${meetingName}\n` +
+      `  Folder: .pi-meetings/${meetingName}/\n` +
+      `  Watcher active — entries will appear as cards` +
+      (isBrainstorm
+        ? ""
+        : "\n  Open-ended — runs until convergence or you intervene");
+    promptText = isBrainstorm
+      ? buildBrainstormPrompt(topic, absDir, participants)
+      : buildDebatePrompt(topic, absDir, participants);
+  }
+
+  // Seed manifest
+  const manifest: MeetingManifest = {
+    topic,
+    created: new Date().toISOString(),
+    lastUpdate: new Date().toISOString(),
+    entryCount: 0,
+  };
+  await writeManifest(absDir, manifest);
+
+  // Seed index.jsonl (empty)
+  const indexJsonlPath = path.join(absDir, "index.jsonl");
+  assertWritableFilePath(indexJsonlPath, absDir, "meeting index");
+  if (!fs.existsSync(indexJsonlPath)) {
+    await fsp.writeFile(indexJsonlPath, "", "utf-8");
+  }
+
+  // Seed blackboard.md header
+  const blackboardPath = path.join(absDir, "blackboard.md");
+  assertWritableFilePath(blackboardPath, absDir, "meeting blackboard");
+  await fsp.writeFile(blackboardPath, blackboardHeader.join("\n"), "utf-8");
+
+  // Start watcher
+  startWatching(pi, absDir);
+
+  ctx.ui.notify(notifyText, "info");
+
+  // Send orchestration prompt to main agent
+  pi.sendUserMessage([
+    {
+      type: "text" as const,
+      text: promptText,
+    },
+  ]);
+}
+
+/**
+ * Shared handler for the *-from-file commands: load the session file,
+ * select the named participants, and start the requested session kind.
+ */
+async function runFromFile(
+  pi: ExtensionAPI,
+  ctx: any,
+  kind: SessionKind,
+  args: string | undefined,
+  usage: string
+): Promise<void> {
+  const fileArg = cleanArg(args ?? "");
+  if (!fileArg) {
+    ctx.ui.notify(usage, "warning");
+    return;
+  }
+
+  let session: SessionFile;
+  try {
+    session = loadSessionFile(ctx.cwd, fileArg);
+  } catch (err: any) {
+    ctx.ui.notify(`pi-brainstorm session error: ${err.message}`, "error");
+    return;
+  }
+
+  const participants = await prepareParticipants(ctx, session.participants);
+  if (!participants) return;
+
+  await startSession(pi, ctx, kind, session.topic, participants);
+}
+
+// ────────────────────────────────────────────────────────
 // Main Extension
 // ────────────────────────────────────────────────────────
 
@@ -2614,197 +2911,66 @@ export default function (pi: ExtensionAPI) {
   // ── Command: /brainstorm ─────────────────────────────
 
   pi.registerCommand("brainstorm", {
-    description:
-      "Start a multi-agent brainstorming session on a topic",
+    description: "Start a multi-agent brainstorming session on a topic",
     handler: async (args, ctx) => {
-      if (!args || !args.trim()) {
+      const topic = cleanArg(args ?? "");
+      if (!topic) {
         ctx.ui.notify("Usage: /brainstorm <topic>", "warning");
         return;
       }
+      const participants = await prepareParticipants(ctx);
+      if (!participants) return;
+      await startSession(pi, ctx, "brainstorm", topic, participants);
+    },
+  });
 
-      // Resolve participants from config
-      let participants: ParticipantConfig[];
-      try {
-        participants = resolveParticipants(ctx.cwd);
-      } catch (err: any) {
-        ctx.ui.notify(
-          `pi-brainstorm config error: ${err.message}`,
-          "error"
-        );
-        return;
-      }
+  // ── Command: /brainstorm-from-file ───────────────────
 
-      const agentsReady = await ensureAgentsFromConfig(ctx, participants, {
-        allowGlobalWrites: !hasProjectConfig(ctx.cwd),
-      });
-      if (!agentsReady) return;
-
-      const topic = args.trim();
-      let absDir: string;
-      let meetingName: string;
-      try {
-        ({ absDir, meetingName } = await createUniqueMeetingDir(
-          ctx.cwd,
-          initialMeetingName("brainstorm")
-        ));
-      } catch (err: any) {
-        ctx.ui.notify(`Failed to create meeting folder: ${err.message}`, "error");
-        return;
-      }
-
-      // Assertions (createUniqueMeetingDir already created dir + entries)
-      assertDirectoryNoSymlink(absDir, "meeting directory");
-      assertDirectoryNoSymlink(
-        path.join(absDir, "entries"),
-        "entries directory"
+  pi.registerCommand("brainstorm-from-file", {
+    description:
+      "Start a brainstorming session from a YAML file " +
+      "(topic + participant agent names)",
+    handler: async (args, ctx) => {
+      await runFromFile(
+        pi,
+        ctx,
+        "brainstorm",
+        args,
+        "Usage: /brainstorm-from-file <session.yaml>"
       );
-
-      // Seed manifest
-      const manifest: MeetingManifest = {
-        topic,
-        created: new Date().toISOString(),
-        lastUpdate: new Date().toISOString(),
-        entryCount: 0,
-      };
-      await writeManifest(absDir, manifest);
-
-      // Seed index.jsonl (empty)
-      const indexJsonlPath = path.join(absDir, "index.jsonl");
-      assertWritableFilePath(indexJsonlPath, absDir, "meeting index");
-      if (!fs.existsSync(indexJsonlPath)) {
-        await fsp.writeFile(indexJsonlPath, "", "utf-8");
-      }
-
-      // Seed blackboard.md header
-      const blackboardPath = path.join(absDir, "blackboard.md");
-      assertWritableFilePath(blackboardPath, absDir, "meeting blackboard");
-      const blackboardHeader = [
-        `# Meeting: ${topic}`,
-        `> Created: ${new Date().toISOString()}`,
-        `> Type: Brainstorming (3 rounds)`,
-        "",
-        "---",
-        "",
-      ].join("\n");
-      await fsp.writeFile(blackboardPath, blackboardHeader, "utf-8");
-
-      // Start watcher
-      startWatching(pi, absDir);
-
-      ctx.ui.notify(
-        `🧠 Multi-agent brainstorm: ${meetingName}\n` +
-          `  Folder: .pi-meetings/${meetingName}/\n` +
-          `  Watcher active — entries will appear as cards`,
-        "info"
-      );
-
-      // Send orchestration prompt to main agent
-      const promptText = buildBrainstormPrompt(topic, absDir, participants);
-      pi.sendUserMessage([
-        {
-          type: "text" as const,
-          text: promptText,
-        },
-      ]);
     },
   });
 
   // ── Command: /debate ─────────────────────────────────
 
   pi.registerCommand("debate", {
-    description:
-      "Start a multi-agent debate battle — runs until convergence",
+    description: "Start a multi-agent debate battle — runs until convergence",
     handler: async (args, ctx) => {
-      if (!args || !args.trim()) {
+      const topic = cleanArg(args ?? "");
+      if (!topic) {
         ctx.ui.notify("Usage: /debate <topic>", "warning");
         return;
       }
+      const participants = await prepareParticipants(ctx);
+      if (!participants) return;
+      await startSession(pi, ctx, "debate", topic, participants);
+    },
+  });
 
-      // Resolve participants from config
-      let participants: ParticipantConfig[];
-      try {
-        participants = resolveParticipants(ctx.cwd);
-      } catch (err: any) {
-        ctx.ui.notify(
-          `pi-brainstorm config error: ${err.message}`,
-          "error"
-        );
-        return;
-      }
+  // ── Command: /debate-from-file ───────────────────────
 
-      const agentsReady = await ensureAgentsFromConfig(ctx, participants, {
-        allowGlobalWrites: !hasProjectConfig(ctx.cwd),
-      });
-      if (!agentsReady) return;
-
-      const topic = args.trim();
-      let absDir: string;
-      let meetingName: string;
-      try {
-        ({ absDir, meetingName } = await createUniqueMeetingDir(
-          ctx.cwd,
-          initialMeetingName("debate")
-        ));
-      } catch (err: any) {
-        ctx.ui.notify(`Failed to create meeting folder: ${err.message}`, "error");
-        return;
-      }
-
-      // Assertions (createUniqueMeetingDir already created dir + entries)
-      assertDirectoryNoSymlink(absDir, "meeting directory");
-      assertDirectoryNoSymlink(
-        path.join(absDir, "entries"),
-        "entries directory"
+  pi.registerCommand("debate-from-file", {
+    description:
+      "Start a debate from a YAML file " +
+      "(topic + participant agent names)",
+    handler: async (args, ctx) => {
+      await runFromFile(
+        pi,
+        ctx,
+        "debate",
+        args,
+        "Usage: /debate-from-file <session.yaml>"
       );
-
-      // Seed manifest
-      const manifest: MeetingManifest = {
-        topic,
-        created: new Date().toISOString(),
-        lastUpdate: new Date().toISOString(),
-        entryCount: 0,
-      };
-      await writeManifest(absDir, manifest);
-
-      // Seed index.jsonl (empty)
-      const indexJsonlPath = path.join(absDir, "index.jsonl");
-      assertWritableFilePath(indexJsonlPath, absDir, "meeting index");
-      if (!fs.existsSync(indexJsonlPath)) {
-        await fsp.writeFile(indexJsonlPath, "", "utf-8");
-      }
-
-      // Seed blackboard.md header
-      const blackboardPath = path.join(absDir, "blackboard.md");
-      assertWritableFilePath(blackboardPath, absDir, "meeting blackboard");
-      const blackboardHeader = [
-        `# Debate: ${topic}`,
-        `> Created: ${new Date().toISOString()}`,
-        `> Type: Open-ended debate (until convergence)`,
-        "",
-        "---",
-        "",
-      ].join("\n");
-      await fsp.writeFile(blackboardPath, blackboardHeader, "utf-8");
-
-      // Start watcher
-      startWatching(pi, absDir);
-
-      ctx.ui.notify(
-        `⚔️ Multi-agent debate: ${meetingName}\n` +
-          `  Folder: .pi-meetings/${meetingName}/\n` +
-          `  Watcher active — entries will appear as cards\n` +
-          `  Open-ended — runs until convergence or you intervene`,
-        "info"
-      );
-
-      // Send orchestration prompt to main agent
-      const promptText = buildDebatePrompt(topic, absDir, participants);
-      pi.sendUserMessage([
-        {
-          type: "text" as const,
-          text: promptText,
-        },
-      ]);
     },
   });
 
@@ -2813,106 +2979,17 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("brainstorm-lab", {
     description:
-      "Start a v2 lab brainstorming session with artifact tracking, edges, state, and context packs",
+      "Start a v2 lab brainstorming session with artifact tracking, " +
+      "edges, state, and context packs",
     handler: async (args, ctx) => {
-      if (!args || !args.trim()) {
+      const topic = cleanArg(args ?? "");
+      if (!topic) {
         ctx.ui.notify("Usage: /brainstorm-lab <topic>", "warning");
         return;
       }
-
-      // Resolve participants from config
-      let participants: ParticipantConfig[];
-      try {
-        participants = resolveParticipants(ctx.cwd);
-      } catch (err: any) {
-        ctx.ui.notify(
-          `pi-brainstorm config error: ${err.message}`,
-          "error"
-        );
-        return;
-      }
-
-      const agentsReady = await ensureAgentsFromConfig(ctx, participants, {
-        allowGlobalWrites: !hasProjectConfig(ctx.cwd),
-      });
-      if (!agentsReady) return;
-
-      const topic = args.trim();
-      let absDir: string;
-      let meetingName: string;
-      try {
-        ({ absDir, meetingName } = await createUniqueMeetingDir(
-          ctx.cwd,
-          initialMeetingName("brainstorm")
-        ));
-      } catch (err: any) {
-        ctx.ui.notify(`Failed to create meeting folder: ${err.message}`, "error");
-        return;
-      }
-
-      // Assertions
-      assertDirectoryNoSymlink(absDir, "meeting directory");
-      assertDirectoryNoSymlink(
-        path.join(absDir, "entries"),
-        "entries directory"
-      );
-
-      // Create lab subdirectories
-      const viewsDir = path.join(absDir, "views");
-      await fsp.mkdir(viewsDir, { recursive: true });
-      assertDirectoryNoSymlink(viewsDir, "views directory");
-
-      // Seed lab files
-      await seedLabMeeting(absDir, topic, participants);
-
-      // Seed manifest
-      const manifest: MeetingManifest = {
-        topic,
-        created: new Date().toISOString(),
-        lastUpdate: new Date().toISOString(),
-        entryCount: 0,
-      };
-      await writeManifest(absDir, manifest);
-
-      // Seed index.jsonl (empty)
-      const indexJsonlPath = path.join(absDir, "index.jsonl");
-      assertWritableFilePath(indexJsonlPath, absDir, "meeting index");
-      await fsp.writeFile(indexJsonlPath, "", "utf-8");
-
-      // Seed blackboard.md header
-      const blackboardPath = path.join(absDir, "blackboard.md");
-      assertWritableFilePath(blackboardPath, absDir, "meeting blackboard");
-      const blackboardHeader = [
-        `# Lab: ${topic}`,
-        `> Mode: brainstorm-lab v2`,
-        `> Created: ${new Date().toISOString()}`,
-        `> Artifact tracking: enabled`,
-        `> Edges: enabled`,
-        `> State management: events + state.json`,
-        "",
-        "---",
-        "",
-      ].join("\n");
-      await fsp.writeFile(blackboardPath, blackboardHeader, "utf-8");
-
-      // Start watcher
-      startWatching(pi, absDir);
-
-      ctx.ui.notify(
-        `🧪 Brainstorm Lab: ${meetingName}\n` +
-        `  Folder: .pi-meetings/${meetingName}\n` +
-        `  Artifact tracking + edges + state management active`,
-        "info"
-      );
-
-      // Send orchestration prompt to main agent
-      const promptText = buildBrainstormLabPrompt(topic, absDir, participants);
-      pi.sendUserMessage([
-        {
-          type: "text" as const,
-          text: promptText,
-        },
-      ]);
+      const participants = await prepareParticipants(ctx);
+      if (!participants) return;
+      await startSession(pi, ctx, "lab", topic, participants);
     },
   });
 
