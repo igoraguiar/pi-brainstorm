@@ -5,6 +5,28 @@ All notable changes to `pi-brainstorm` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-11
+
+### Added
+
+- `/brainstorm-participants` and the `meeting_list_participants` facilitator tool
+  report the effective merged participant roster: `displayName`, `agentName`,
+  `model` (or "inherit main model"), thinking level, timeout, debate persona,
+  tombstoned names, and which config layers were loaded. `configLayers()` now backs
+  both `loadConfig` and the roster reporter, so the reported provenance cannot drift
+  from what is actually loaded. Children never receive the tool, since the `--tools`
+  allowlist is built from `CORE_WORK_TOOLS` + `MEETING_TOOLS`. (`f796b2b`)
+
+### Internal
+
+- Vendor 29 agent skills from `mattpocock/skills` and `asyrafhussin/agent-skills`
+  under `.agents/skills`, pinned by a new `skills-lock.json` that records each
+  skill's source path and content hash. Nothing new ships: neither path is listed in
+  `package.json` `files`. (`b6729c9`)
+- Add two session handoff notes under `handoff/` covering the native child runner,
+  the 0.8.0 release state, and the participants roster work. (`9b3a74b`)
+- Ignore workspace-local `.pi/` settings and `package-lock.json`. (`ec999b5`)
+
 ## [0.8.0] - 2026-10-12
 
 First tagged release. Versions 0.1.0 through 0.7.0 were published without tags, so
