@@ -10,20 +10,21 @@ A Chinese (zh-CN) translation of this README is available at [README.zh-CN.md](.
 
 ## Features
 
-- Configurable multi-agent brainstorming (defaults: GPT-Progressive, GPT-Localist, GPT-Diagnostician, GPT-Critic; each spawned as a subagent job with its own role prompt).
+- Configurable multi-agent brainstorming (defaults: GPT-Progressive, GPT-Localist, GPT-Diagnostician, GPT-Critic; each runs as a headless Pi child with its own role brief).
 - Debate / battle mode where agents prosecute, stress-test, and challenge positions.
 - Configuration-driven: add, remove, or customize participants via YAML.
+- Per-participant model and thinking level, inherited from the main agent when unset.
 - Full participant contributions stored as Markdown files under `.pi-meetings/`.
 - Compact visible cards in the main conversation instead of long pasted transcripts.
 - JSONL index for lightweight cross-round context.
-- Built on `@narumitw/pi-subagents` v3 (`subagent_spawn` / `subagent_wait`).
+- No subagent extension required: participants run as supervised `pi --print` subprocesses.
 
 ## Install
 
 Recommended one-line install:
 
 ```bash
-pi install npm:@narumitw/pi-subagents && pi install npm:pi-brainstorm
+pi install npm:pi-brainstorm
 ```
 
 Install only this package from npm:
@@ -46,25 +47,37 @@ pi install /Users/jarcis/Project/pi-brainstorm
 
 ## Prerequisites
 
-`pi-brainstorm` orchestrates participants through `@narumitw/pi-subagents` **v3**, which registers the `subagent_spawn` / `subagent_wait` tools. Install it separately before using `/brainstorm` or `/debate`:
+`pi-brainstorm` has **no subagent-extension prerequisite**. It spawns and supervises
+participant children itself by running headless Pi processes:
 
-```bash
-pi install npm:@narumitw/pi-subagents
+```text
+pi --print --no-session --model <provider/id> --thinking <level> \
+   --append-system-prompt .pi-meetings/<meeting>/roles/<agentName>.md \
+   --tools read,grep,find,ls,meeting_append_entry,meeting_read_index,meeting_read_entry \
+   -e <path-to>/extensions/brainstorm.ts -- "<round mission + blackboard instructions>"
 ```
 
-`@narumitw/pi-subagents` runs each participant job in an isolated Pi subprocess. It is a runtime prerequisite, not bundled inside `pi-brainstorm`.
+What that means in practice:
 
-The v3 runtime has **no `subagent` tool and no named-agent catalog**. `pi-brainstorm` therefore delegates with self-contained tasks: each participant's role text comes from your YAML config, and the child is granted the blackboard tools by attaching this same extension to the job.
+- **Model resolution is pi's own.** Children load your settings extensions, so a
+  provider registered by an extension (a proxy or custom provider) resolves exactly
+  as it does for the main agent.
+- **Credentials must be stored or in the environment.** A child process cannot read
+  an in-process auth callback, a browser login, or a temporary OAuth token. Run
+  `pi --list-models` and check the `Auth` column: only `stored` and `env` can run a
+  participant. `pi-brainstorm` preflights this and reports `unavailable` instead of
+  spawning a child that cannot authenticate.
+- **Children are constrained by `--tools`.** Each child gets `read`, `grep`, `find`,
+  `ls` plus `meeting_append_entry`, `meeting_read_index`, and `meeting_read_entry`.
+  Facilitator and lab tools stay with the main agent.
+- **Timeouts are wall-clock seconds per attempt**, enforced by this extension
+  (SIGTERM, then SIGKILL).
+- Project-local installs may require project trust before the attached extension can
+  load in a child.
 
-Key v3 behaviors that shape how `pi-brainstorm` works:
-
-- `subagent_spawn({ task, tools, extensions, thinkingLevel?, timeout? })` returns a `jobId` immediately; the job runs in the background. Wait for it with `subagent_wait({ jobId })`.
-- Terminal states are `completed`, `partial`, `failed`, `timed_out`, and `cancelled`.
-- Children inherit the main agent's model. There is **no per-job model override**; configure roles in YAML instead of selecting base models per participant.
-- Children do **not** inherit the main agent's extension tools. `pi-brainstorm` attaches its own extension to each child and exposes only `meeting_append_entry`, `meeting_read_index`, and `meeting_read_entry`.
-- Timeouts are in **seconds** (the old `PI_SUBAGENT_TIMEOUT_MS` environment variable no longer applies). Participant full text is written to `.pi-meetings/...`; the main chat should only receive short `WROTE_ENTRY` summaries and facilitator synthesis.
-
-Project-local installs may require project trust before the attached extension can load in a child.
+Nothing is installed under `~/.pi/agent/agents/`, and no agent markdown files are
+generated. If you used `pi-brainstorm` 0.5.x, you can delete any previously
+generated `*-brainstormer.md` files.
 
 ## Configuration
 
@@ -74,7 +87,26 @@ Participants are defined in YAML. The extension loads config in this order (late
 2. User override: `~/.pi/agent/pi-brainstorm.yaml`
 3. Project override: `.pi-brainstorm.yaml` or `.pi/pi-brainstorm.yaml`
 
-Arrays (e.g. `participants`) replace entirely; objects deep-merge.
+`participants` merges **by `agentName`** across layers:
+
+| You write | Effect |
+| --- | --- |
+| A participant whose `agentName` already exists | Patches that participant field by field; unmentioned fields keep their lower-layer value |
+| A new `agentName` | Adds a participant |
+| An existing participant you do not mention | Survives unchanged |
+| `disabled: true` on an `agentName` | Removes that participant, and tombstones the name so a lower-priority file cannot re-add it |
+
+Every other array replaces entirely; objects deep-merge. Merge order is deterministic (package → user → project), so a project file can override one participant without redefining the roster.
+
+```yaml
+# .pi/pi-brainstorm.yaml — change only the critic's model, keep everything else
+participants:
+  - agentName: gpt-critic-brainstormer
+    model: openrouter/z-ai/glm-4.6:xhigh
+
+  - agentName: gpt-localist-brainstormer
+    disabled: true
+```
 
 ### Adding a new participant
 
@@ -102,25 +134,45 @@ participants:
         precision. Find the weakest link in every chain of reasoning.
         Answer in the user's language; default to English.
     brainstormRole: Nuanced analyst
-    # optional: per-participant thinking level and execution timeout
-    # thinkingLevel: xhigh
-    # timeoutSeconds: 900
+    # optional per-participant overrides
+    model: anthropic/claude-sonnet-4-5   # provider/id[:thinking]; omit to inherit the main model
+    thinkingLevel: xhigh
+    timeoutSeconds: 900
+    disabled: false
 ```
 
 To replace the default participants entirely, define a full `participants` list in your override file.
 
-Top-level options are also available:
+Top-level options:
 
-- `thinkingLevel` — default thinking level passed to `subagent_spawn` (one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit to inherit the main agent's level.
-- `subagentTimeoutSeconds` — default job execution timeout in seconds (default `900`).
-- `subagentWaitTimeoutSeconds` — default `subagent_wait` timeout in seconds (default `900`).
+- `thinkingLevel` — default thinking level for every child (one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit to inherit the main agent's level.
+- `childTimeoutSeconds` — wall-clock limit per child attempt, in seconds (default `900`). `subagentTimeoutSeconds` is the legacy name and still works.
+- `maxParallel` — how many participants run at once in a round (default `4`, max `16`).
+- `maxRetries` — retries per participant inside one round (default `2`, so 3 attempts total).
+- `piBinary` — optional path to the pi executable used to spawn children. By default the extension resolves the installed pi package's own entry point, then `pi` on `PATH`.
 - `extensionPath` — override the pi-brainstorm extension path attached to children (advanced).
 
-> The legacy `model:` field still loads for backward compatibility but is ignored: pi-subagents v3 children always inherit the main agent's model.
+### Participant models
 
-### Subagent runtime
+`model` uses pi's own spec format, `provider/modelId[:thinking]`, and is resolved by
+pi exactly as `pi --print --model ...` would resolve it. Model ids may contain `/`
+(`openrouter/z-ai/glm-4.6`), so only the first `/` separates the provider.
 
-`pi-brainstorm` no longer generates agent files. Each participant's role text is injected into the `subagent_spawn` task, and the child is given the blackboard tools by attaching this extension to the job. There is nothing to install under `~/.pi/agent/agents/`; you can delete any previously generated `*-brainstormer.md` files.
+A participant runs only if its provider has **stored or environment** credentials.
+Process-local auth is rejected up front with an `unavailable` result and the reason,
+so a round never hangs waiting on a child that cannot authenticate.
+
+### Participant runtime
+
+Each participant gets a generated **role brief** written to
+`.pi-meetings/<meeting>/roles/<agentName>.md` and passed to the child through
+`--append-system-prompt`, so the role text lands in the child's system prompt instead
+of being pasted into its task. The brief is regenerated per round and lives inside the
+meeting folder — it is not a global agent catalog, and it is not user-editable.
+
+The facilitator never writes participant prompts, roles, models, or tool lists: it calls
+`meeting_run_round` / `meeting_run_cycle`, and this extension builds and supervises the
+child processes.
 ## Commands
 
 ```text
@@ -160,9 +212,11 @@ The path is resolved relative to the current working directory (absolute paths a
 ## How It Works
 
 ```text
-facilitator -> subagent_spawn(task) -> child reads/writes blackboard via meeting_* tools
-child -> meeting_append_entry -> .pi-meetings/... files
-child -> short WROTE_ENTRY summary -> subagent_wait result -> facilitator context
+facilitator -> meeting_run_round / meeting_run_cycle
+            -> extension spawns headless pi children (role brief + mission + --tools allowlist)
+child       -> reads prior entries with meeting_read_index / meeting_read_entry
+child       -> meeting_append_entry -> .pi-meetings/... files
+child       -> short WROTE_ENTRY summary -> outcome (ok | failed | timeout | unavailable)
 file watcher -> compact visible card -> main chat
 facilitator -> round checkpoint / consensus / disagreement / final synthesis
 ```
@@ -173,13 +227,17 @@ The blackboard files are the source of truth for the session. The facilitator ca
 
 The extension registers a blackboard tool set:
 
+- `meeting_run_round` (facilitator-only) runs one brainstorm round: every participant runs as a headless Pi child in parallel, reads prior entries from the blackboard, and writes its contribution. Retries happen inside the tool.
+- `meeting_run_cycle` (facilitator-only) runs ONE debater and waits for it, so each debater sees every prior entry.
 - `meeting_rename` (facilitator-only) renames the meeting directory to a human-readable title before Round 1 starts.
 - `meeting_append_entry` writes a full participant contribution to disk and returns only a short reference.
 - `meeting_read_index` lists entries by id, speaker, phase, summary, and path.
 - `meeting_read_entry` reads one full entry when the facilitator or a participant needs it.
 - `meeting_append_artifact`, `meeting_append_edge`, `meeting_read_artifacts`, `meeting_get_state`, `meeting_update_state`, and `meeting_log_event` back the v2 lab mode (artifact/edge/state tracking).
 
-Children spawned for a session receive only `meeting_append_entry`, `meeting_read_index`, and `meeting_read_entry`, via the attached extension. The remaining tools stay with the facilitating main agent.
+Participants receive only `read`, `grep`, `find`, `ls` plus `meeting_append_entry`, `meeting_read_index`, and `meeting_read_entry`. The remaining tools stay with the facilitating main agent.
+
+A run tool reports one state per participant: `ok` (entry written, with entry id and summary), `failed`, `timeout`, or `unavailable` (model could not be verified or authenticated; no child was spawned).
 
 ## Files
 
@@ -190,27 +248,43 @@ Each session writes an append-only folder under the current working directory:
   manifest.json
   index.jsonl
   blackboard.md
+  roles/
+    gpt-critic-brainstormer.md
   entries/
     0001-gpt-progressive-round_1.md
     0002-gpt-localist-round_1.md
 ```
 
-`blackboard.md` is the full transcript. `index.jsonl` is the compact context entry point. Full participant text lives in `entries/`.
+`blackboard.md` is the full transcript. `index.jsonl` is the compact context entry point. Full participant text lives in `entries/`, and the per-round role briefs passed to each child live in `roles/`.
 
 ## Safety
 
 The extension validates that meeting paths stay under the current workspace's `.pi-meetings/` directory and rejects symlinked meeting paths, entry files, index files, and blackboard files. Entry writes use exclusive creation to avoid overwriting existing files.
 
-## Migrating from 2.x
+## Migration notes
 
-`pi-brainstorm` v0.6 targets `@narumitw/pi-subagents` **v3**. If you upgraded that package from 2.x, note that v3 removed the `subagent` tool, the named-agent catalog, per-job model overrides, and custom system prompts. `pi-brainstorm` was updated accordingly:
+### 0.7.0 — participants are native Pi children
 
-- Orchestration now uses `subagent_spawn` + `subagent_wait` instead of `subagent`.
-- Participant role text is injected into the spawn task; generated agent files are gone.
-- The child receives the blackboard tools through `extensions: [{ path, tools }]`.
-- `model:` in participant config is ignored; use `thinkingLevel` for reasoning depth.
+`pi-brainstorm` 0.7 no longer depends on `@narumitw/pi-subagents`. Uninstall it if you
+installed it only for this package:
 
-Start a fresh Pi session after upgrading so stored calls no longer request removed tool names.
+```bash
+pi remove npm:@narumitw/pi-subagents
+```
+
+- Orchestration now uses `meeting_run_round` / `meeting_run_cycle`; `subagent_spawn`,
+  `subagent_wait`, and the named-agent catalog are gone from this package.
+- Per-participant `model:` works again, and `thinkingLevel` is passed to each child.
+- Role text is delivered through `--append-system-prompt`, not pasted into a task.
+- Start a fresh Pi session after upgrading so stored calls no longer request removed
+  tool names.
+
+### 0.6.0 — the pi-subagents v3 experiment
+
+v0.6 targeted `@narumitw/pi-subagents` **v3**, which had no `subagent` tool, no
+named-agent catalog, no per-job model override, and no custom system prompts. That
+experiment is reverted; the v0.6 behaviour is documented here only for sessions that
+still have those tool calls in history.
 
 ## Development
 

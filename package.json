@@ -1,6 +1,6 @@
 {
   "name": "pi-brainstorm",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Multi-agent brainstorming and debate sessions for pi subagent jobs.",
   "type": "module",
   "keywords": [

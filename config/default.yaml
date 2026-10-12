@@ -1,21 +1,38 @@
 # pi-brainstorm default configuration
-# Each participant defines a subagent role for brainstorm/debate sessions.
+# Each participant is one headless Pi child process in a brainstorm/debate.
 #
 # To override: create ~/.pi/agent/pi-brainstorm.yaml (user-level)
 #               or .pi-brainstorm.yaml / .pi/pi-brainstorm.yaml (project-level)
-# Later files override earlier. Arrays replace entirely; objects deep-merge.
 #
-# pi-subagents v3 notes:
-#   * Children inherit the main agent's effective model. There is no per-job
-#     model override, so `model:` below is legacy/informational only.
-#   * `thinkingLevel` (off|minimal|low|medium|high|xhigh|max) is passed to
-#     subagent_spawn; omit to inherit the main agent's level.
-#   * `subagentTimeoutSeconds` / `subagentWaitTimeoutSeconds` tune job and wait
-#     timeouts in seconds (default 900).
+# Merge rules:
+#   * `participants` merges BY `agentName`: a later layer patches the
+#     participant with the same agentName, new agentNames are added,
+#     unmentioned ones survive, and `disabled: true` removes one (a
+#     tombstone, so a lower layer cannot re-add it).
+#   * Every other array replaces entirely; objects deep-merge.
+#
+# Execution keys:
+#   * thinkingLevel: off|minimal|low|medium|high|xhigh|max — the default for
+#     every child. A participant's own `thinkingLevel`, or a `:thinking`
+#     suffix on its model, overrides it.
+#   * childTimeoutSeconds: wall-clock limit per child attempt (default 900).
+#     `subagentTimeoutSeconds` is the legacy name and still works.
+#   * maxParallel: how many children run at once (default 4, max 16).
+#   * maxRetries: retries per participant inside one round (default 2, so
+#     3 attempts total).
+#   * piBinary: optional path to the pi executable used to spawn children.
+#
+# Per-participant `model`:
+#   * Format: provider/modelId[:thinking], e.g. anthropic/claude-sonnet-4-5
+#     or openrouter/z-ai/glm-4.6:xhigh. Omit it to inherit the main model.
+#   * The provider must have STORED or ENVIRONMENT credentials: a child
+#     process cannot read an in-process auth callback.
+#   * `disabled: true` removes a participant without deleting its definition.
 
 thinkingLevel: xhigh
-subagentTimeoutSeconds: 900
-subagentWaitTimeoutSeconds: 900
+childTimeoutSeconds: 900
+maxParallel: 4
+maxRetries: 2
 
 participants:
   - displayName: GPT-Progressive
@@ -23,7 +40,7 @@ participants:
     description: >-
       GPT-5.5-backed progressive scout who argues from new options, new
       methods, and emerging perspectives.
-    # model: legacy/informational — children inherit the main agent's model
+    # model: neibu/gpt-5.5:xhigh   # omit to inherit the main agent's model
     roleTitle: Progressive Scout / New-Option Advocate
     rolePrompt: |
       You are the progressive scout in the brainstorm. You default to
