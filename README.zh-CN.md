@@ -150,12 +150,24 @@ pi --print --no-session --model <provider/id> --thinking <level> \
 
 ```text
 /brainstorm <主题>
+/brainstorm-from-file <session.yaml>
+/brainstorm-participants [agentName]
 /debate <主题>
+/debate-from-file <session.yaml>
+/brainstorm-lab <主题>
 ```
 
 `/brainstorm` 启动交互式三轮多 Agent 头脑风暴。Round 1 和 Round 2 结束后，主持人应停止、总结本轮，并等待你的反馈或继续许可，再进入下一轮。
 
 `/debate` 启动开放式多 Agent battle，直到收敛或用户介入为止。
+
+`/brainstorm-lab` 启动 v2 lab 会话，包含 artifact 跟踪、edge 图、状态管理与 context pack。
+
+`/brainstorm-participants` 打印当前生效的参与者名单：每人一行，包含 `displayName`、`agentName`、模型（或 `inherit main model`）、思考等级、超时、是否有辩论人格，以及被墓碑移除的名字和实际加载的配置层。传入 `agentName` 可只查看某一个参与者。
+
+### 查看可用参与者
+
+名单是所有配置层合并后的结果，所以 `/brainstorm-participants` 是确认当前项目里到底有哪些参与者的最快方式——它包含包默认、用户级和项目级覆盖，也包含 `disabled: true` 墓碑，而且不需要启动会话。主持 Agent 也可以通过 `meeting_list_participants` 工具获取同样的数据。
 
 
 ## 工作方式
@@ -178,6 +190,7 @@ pi --print --no-session --model <provider/id> --thinking <level> \
 
 - `meeting_run_round`（仅主持人）：运行一轮头脑风暴。每个参与者作为 headless Pi 子进程并行运行，自己读取已有条目，并写入完整发言。重试在工具内部完成。
 - `meeting_run_cycle`（仅主持人）：只运行一个辩论者并等待它完成，保证每个辩论者都能看到之前的全部条目。
+- `meeting_list_participants`（仅主持人）：列出生效名单，包含 `agentName`、`displayName`、模型、思考等级、超时、工作工具、墓碑名单，以及产生这些结果的配置层。可用 `meetingDir` 限定到某个会话。
 - `meeting_rename`（仅主持人）：在 Round 1 开始前将会议目录重命名为人类可读的标题。
 - `meeting_append_entry`：把参与者完整发言写入磁盘，只返回短引用。
 - `meeting_read_index`：读取条目索引，包含 id、speaker、phase、summary、path。

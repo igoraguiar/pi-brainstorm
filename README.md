@@ -178,6 +178,7 @@ child processes.
 ```text
 /brainstorm <topic>
 /brainstorm-from-file <session.yaml>
+/brainstorm-participants [agentName]
 /debate <topic>
 /debate-from-file <session.yaml>
 /brainstorm-lab <topic>
@@ -188,6 +189,12 @@ child processes.
 `/debate` starts an open-ended multi-agent battle that should continue until convergence or user intervention.
 
 `/brainstorm-lab` starts a v2 lab session with artifact tracking, edges, state management, and context packs.
+
+`/brainstorm-participants` prints the effective participant roster: one aligned row per participant with `displayName`, `agentName`, model (or `inherit main model`), thinking level, timeout, whether a debate persona exists, the tombstoned names, and which config layers were loaded. Pass an `agentName` to see a single participant.
+
+### Listing participants
+
+The roster is the merge of every config layer, so `/brainstorm-participants` is the quickest way to see what is actually available in the current project — it reflects package, user, and project overrides plus `disabled: true` tombstones, without starting a session. The same data is available to the facilitating agent as the `meeting_list_participants` tool.
 
 ### Session files
 
@@ -229,6 +236,7 @@ The extension registers a blackboard tool set:
 
 - `meeting_run_round` (facilitator-only) runs one brainstorm round: every participant runs as a headless Pi child in parallel, reads prior entries from the blackboard, and writes its contribution. Retries happen inside the tool.
 - `meeting_run_cycle` (facilitator-only) runs ONE debater and waits for it, so each debater sees every prior entry.
+- `meeting_list_participants` (facilitator-only) lists the effective roster: `agentName`, `displayName`, model, thinking level, timeout, work tools, tombstoned names, and the config layers that produced them. Scope it to one session with `meetingDir`.
 - `meeting_rename` (facilitator-only) renames the meeting directory to a human-readable title before Round 1 starts.
 - `meeting_append_entry` writes a full participant contribution to disk and returns only a short reference.
 - `meeting_read_index` lists entries by id, speaker, phase, summary, and path.

@@ -35,6 +35,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -461,6 +462,43 @@ function getExtensionDir(): string {
 }
 
 /**
+ * Config layers in load order (later wins), with existence resolved.
+ * Shared by loadConfig and the participant roster reporter so they cannot drift.
+ */
+type ConfigLayerKind = "package" | "user" | "project";
+
+interface ConfigLayer {
+  path: string;
+  kind: ConfigLayerKind;
+  exists: boolean;
+}
+
+function configLayers(cwd: string): ConfigLayer[] {
+  const extensionDir = getExtensionDir();
+  const packageRoot = path.dirname(extensionDir);
+
+  const candidates: { path: string; kind: ConfigLayerKind }[] = [
+    { path: path.join(packageRoot, "config", "default.yaml"), kind: "package" },
+    { path: path.join(extensionDir, "config", "default.yaml"), kind: "package" },
+    { path: path.join(extensionDir, "brainstorm.yaml"), kind: "package" },
+    { path: path.join(getAgentDir(), "pi-brainstorm.yaml"), kind: "user" },
+    { path: path.join(cwd, ".pi-brainstorm.yaml"), kind: "project" },
+    { path: path.join(cwd, ".pi", "pi-brainstorm.yaml"), kind: "project" },
+  ];
+
+  return candidates.map((candidate) => ({
+    ...candidate,
+    exists: fs.existsSync(candidate.path),
+  }));
+}
+
+/** Render a path for humans: home directory becomes `~`. */
+function shortenPath(value: string): string {
+  const home = os.homedir();
+  return value.startsWith(home) ? `~${value.slice(home.length)}` : value;
+}
+
+/**
  * Load and merge config from all locations, in priority order (later wins):
  *   1. Package default: config/default.yaml (relative to package root or extension dir)
  *      Also try brainstorm.yaml in extension dir (for manual installs)
@@ -473,35 +511,25 @@ function getExtensionDir(): string {
  * participants survive, and `disabled: true` tombstones one.
  */
 function loadConfig(cwd: string): BrainstormConfig {
-  const extensionDir = getExtensionDir();
-  const packageRoot = path.dirname(extensionDir);
+  const layers = configLayers(cwd);
   const ignoredTombstones: string[] = [];
-
-  // Step 1: package/extension defaults
-  const defaultCandidates = [
-    path.join(packageRoot, "config", "default.yaml"),
-    path.join(extensionDir, "config", "default.yaml"),
-    path.join(extensionDir, "brainstorm.yaml"),
-  ];
 
   let merged: any = {};
   let loadedAny = false;
 
-  for (const candidate of defaultCandidates) {
-    if (fs.existsSync(candidate)) {
-      try {
-        const raw = fs.readFileSync(candidate, "utf-8");
-        const parsed = YAML.parse(raw);
-        if (parsed && typeof parsed === "object") {
-          merged = mergeConfigLayer(merged, parsed, ignoredTombstones);
-          loadedAny = true;
-        }
-      } catch (err: any) {
-        throw new Error(
-          `Failed to parse config ${candidate}: ${err.message}`
-        );
-      }
+  for (const layer of layers) {
+    if (!layer.exists) continue;
+
+    let parsed: unknown;
+    try {
+      parsed = YAML.parse(fs.readFileSync(layer.path, "utf-8"));
+    } catch (err: any) {
+      throw new Error(`Failed to parse config ${layer.path}: ${err.message}`);
     }
+    if (!parsed || typeof parsed !== "object") continue;
+
+    merged = mergeConfigLayer(merged, parsed, ignoredTombstones);
+    if (layer.kind === "package") loadedAny = true;
   }
 
   if (!loadedAny) {
@@ -1427,6 +1455,91 @@ function toolError(text: string) {
     details: {},
     isError: true,
   };
+}
+
+/** What a participant will actually run with, after config defaults apply. */
+interface ParticipantSummary {
+  agentName: string;
+  displayName: string;
+  roleTitle?: string;
+  model: string;
+  thinkingLevel: string;
+  timeoutSeconds: number;
+  tools: string[];
+  hasDebatePersona: boolean;
+}
+
+function summarizeParticipant(
+  config: BrainstormConfig,
+  participant: ParticipantConfig
+): ParticipantSummary {
+  return {
+    agentName: participant.agentName,
+    displayName: participant.displayName,
+    roleTitle: participant.roleTitle,
+    model: participant.model ?? "inherit main model",
+    thinkingLevel: participant.thinkingLevel ?? config.thinkingLevel ?? "inherit main agent",
+    timeoutSeconds: resolveTimeoutSeconds(config, participant),
+    tools: participantCoreTools(participant),
+    hasDebatePersona: Boolean(participant.debatePersona?.prompt),
+  };
+}
+
+/** Human-readable roster: one aligned line per participant plus config provenance. */
+function formatParticipantRoster(
+  summaries: ParticipantSummary[],
+  layers: ConfigLayer[],
+  tombstones: string[]
+): string {
+  if (summaries.length === 0) {
+    return "No participants are available in the effective configuration.";
+  }
+
+  const nameWidth = Math.max(
+    ...summaries.map((s) => s.displayName.length),
+    "displayName".length
+  );
+  const agentWidth = Math.max(
+    ...summaries.map((s) => s.agentName.length),
+    "agentName".length
+  );
+
+  const modelWidth = Math.max(
+    ...summaries.map((s) => s.model.length),
+    "model".length
+  );
+  const thinkingWidth = Math.max(
+    ...summaries.map((s) => s.thinkingLevel.length),
+    "thinking".length
+  );
+
+  const header =
+    `  ${"displayName".padEnd(nameWidth)}  ${"agentName".padEnd(agentWidth)}  ` +
+    `${"model".padEnd(modelWidth)}  ${"thinking".padEnd(thinkingWidth)}  timeout  debate`;
+
+  const rows = summaries.map(
+    (s) =>
+      `  ${s.displayName.padEnd(nameWidth)}  ${s.agentName.padEnd(agentWidth)}  ` +
+      `${s.model.padEnd(modelWidth)}  ${s.thinkingLevel.padEnd(thinkingWidth)}  ` +
+      `${String(s.timeoutSeconds).padStart(7)}s  ${s.hasDebatePersona ? "yes" : "no"}`
+  );
+
+  const loaded = layers.filter((layer) => layer.exists);
+  const provenance = loaded.length
+    ? `    ${loaded.map((layer) => `${layer.kind}: ${shortenPath(layer.path)}`).join("\n    ")}`
+    : "    (none)";
+
+  return [
+    `pi-brainstorm participants: ${summaries.length} available`,
+    "",
+    header,
+    ...rows,
+    "",
+    `Disabled by config (tombstoned): ${tombstones.length ? tombstones.join(", ") : "(none)"}`,
+    "",
+    "Config layers loaded (later wins):",
+    provenance,
+  ].join("\n");
 }
 
 /**
@@ -3124,6 +3237,89 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: meeting_list_participants ───────────────────
+
+  pi.registerTool({
+    name: "meeting_list_participants",
+    label: "List Participants",
+    description:
+      "List the participants available to pi-brainstorm: agentName, displayName, model, " +
+      "thinking level, timeout, work tools, and which config layers produced them. Call it " +
+      "with no arguments for the full effective roster, or with meetingDir to see the roster " +
+      "of one running session. Facilitator-only: participants cannot call this.",
+    parameters: Type.Object({
+      meetingDir: Type.Optional(
+        Type.String({
+          description: "Optional meeting directory (relative to cwd or absolute) to scope the roster to one session",
+        })
+      ),
+      agentName: Type.Optional(
+        Type.String({
+          description: "Optional agentName to report a single participant",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      let config: BrainstormConfig;
+      try {
+        config = loadConfig(ctx.cwd);
+      } catch (err: any) {
+        return toolError(`pi-brainstorm config error: ${err.message}`);
+      }
+
+      const layers = configLayers(ctx.cwd);
+      const tombstones = config.ignoredTombstones ?? [];
+
+      let pool: ParticipantConfig[];
+      let scope = "effective configuration";
+      try {
+        if (params.meetingDir) {
+          const absDir = validateMeetingDir(params.meetingDir, ctx.cwd);
+          const session = activeSessions.get(absDir);
+          pool = session
+            ? session.participants
+            : validateParticipants(config.participants, "participants");
+          scope = session
+            ? `session ${absDir}`
+            : `meeting ${absDir} (no active session for this directory; showing the effective config)`;
+        } else {
+          pool = validateParticipants(config.participants, "participants");
+        }
+      } catch (err: any) {
+        return toolError(err.message);
+      }
+
+      if (params.agentName) {
+        try {
+          pool = selectParticipants(pool, [params.agentName]);
+        } catch (err: any) {
+          return toolError(err.message);
+        }
+      }
+
+      const summaries = pool.map((participant) => summarizeParticipant(config, participant));
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Roster for the ${scope}:\n\n${formatParticipantRoster(summaries, layers, tombstones)}`,
+          },
+        ],
+        details: {
+          scope,
+          participants: summaries,
+          configLayers: layers.map((layer) => ({
+            kind: layer.kind,
+            path: layer.path,
+            exists: layer.exists,
+          })),
+          tombstoned: tombstones,
+        },
+      };
+    },
+  });
+
   // ── Tool: meeting_append_artifact ─────────────────────
 
   pi.registerTool({
@@ -3923,6 +4119,48 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+
+  // ── Command: /brainstorm-participants ─────────────────
+
+  pi.registerCommand("brainstorm-participants", {
+    description:
+      "List the participants available to pi-brainstorm (effective merged roster)",
+    handler: async (args, ctx) => {
+      let config: BrainstormConfig;
+      try {
+        config = loadConfig(ctx.cwd);
+      } catch (err: any) {
+        ctx.ui.notify(`pi-brainstorm config error: ${err.message}`, "error");
+        return;
+      }
+
+      let pool: ParticipantConfig[];
+      try {
+        pool = validateParticipants(config.participants, "participants");
+      } catch (err: any) {
+        ctx.ui.notify(`pi-brainstorm config error: ${err.message}`, "error");
+        return;
+      }
+
+      const filter = cleanArg(args ?? "");
+      if (filter) {
+        try {
+          pool = selectParticipants(pool, [filter]);
+        } catch (err: any) {
+          ctx.ui.notify(err.message, "warning");
+          return;
+        }
+      }
+
+      const summaries = pool.map((participant) =>
+        summarizeParticipant(config, participant)
+      );
+      ctx.ui.notify(
+        formatParticipantRoster(summaries, configLayers(ctx.cwd), config.ignoredTombstones ?? []),
+        "info"
+      );
+    },
+  });
 
   // ── Cleanup on session shutdown ───────────────────────
 
