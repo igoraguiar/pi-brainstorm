@@ -1,7 +1,7 @@
 /**
  * pi-brainstorm — Multi-agent brainstorm/debate extension for Pi
  *
- * Runs brainstorm and debate sessions across multiple subagents configured
+ * Runs brainstorm and debate sessions across multiple headless Pi participants
  * via YAML. Full participant contributions are stored in a local filesystem
  * blackboard, while the main conversation sees compact cards and facilitator
  * synthesis.
@@ -18,12 +18,24 @@
  *   (topic + participant agent names)
  * - meeting-entry message renderer — compact cards with expandable content
  * - File watcher — auto-posts new entries into the main conversation
- * - Managed agent file generation from config
+ *
+ * Delegation is native: participants run as headless Pi child processes that
+ * this extension spawns and supervises itself (`pi --print --model <provider/id>
+ * --append-system-prompt <role brief> --tools <allowlist> -e <this extension>`).
+ * No subagent extension and no agent markdown files are required — YAML is the
+ * single source of truth for participants, roles, and models.
+ *
+ * Config merging: global (~/.pi/agent/pi-brainstorm.yaml) and project
+ * (.pi-brainstorm.yaml, .pi/pi-brainstorm.yaml) layers merge the `participants`
+ * array by `agentName`. A project entry deep-merges over the global participant
+ * with the same agentName, a new agentName is added, unmentioned global
+ * participants keep running, and `disabled: true` tombstones a participant.
  */
 
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -40,21 +52,62 @@ interface DebatePersona {
   prompt: string;
 }
 
+type ThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
 interface ParticipantConfig {
   displayName: string;
+  /** Identity used when merging project config over global config. */
   agentName: string;
   description?: string;
-  model: string;
+  /**
+   * Model for this participant as `provider/id[:thinking]` (e.g.
+   * `openrouter/z-ai/glm-4.6:xhigh`). Authoritative: each child runs this
+   * model. Omit to inherit the main agent's effective model.
+   */
+  model?: string;
   roleTitle?: string;
   rolePrompt: string;
   whatYouDo?: string[];
   debatePersona?: DebatePersona;
   brainstormRole?: string;
+  /** Core work tools for the child (read/grep/find/ls/edit/write/bash/powershell). */
   tools?: string[];
+  /** Per-participant thinking level (also expressible as a `:level` model suffix). */
+  thinkingLevel?: ThinkingLevel;
+  /** Per-participant child wall-clock timeout in seconds. */
+  timeoutSeconds?: number;
+  /**
+   * Tombstone. In a project layer this drops the global participant with the
+   * same agentName; in any layer it removes the participant from the session.
+   */
+  disabled?: boolean;
 }
 
 interface BrainstormConfig {
   participants: ParticipantConfig[];
+  /** Default thinking level for children (omitted = inherit main agent). */
+  thinkingLevel?: ThinkingLevel;
+  /** Max participants spawned concurrently per round (default 4). */
+  maxParallel?: number;
+  /** Extra attempts per participant after the first failure (default 2). */
+  maxRetries?: number;
+  /** Default child wall-clock timeout in seconds (default 900). */
+  childTimeoutSeconds?: number;
+  /** Legacy alias of childTimeoutSeconds, kept so old configs keep working. */
+  subagentTimeoutSeconds?: number;
+  /** Override the pi executable used to spawn children. */
+  piBinary?: string;
+  /** Override the pi-brainstorm extension path attached to children. */
+  extensionPath?: string;
+  /** Set by loadConfig: tombstones that matched no participant. */
+  ignoredTombstones?: string[];
 }
 
 
@@ -215,19 +268,69 @@ interface MeetingEvent {
 // Constants
 // ────────────────────────────────────────────────────────
 
-const MANAGED_MARKER = "<!-- managed-by: pi-brainstorm -->";
 const MEETING_TOOLS = [
   "meeting_append_entry",
   "meeting_read_index",
   "meeting_read_entry",
 ];
-const DEFAULT_TOOLS = [
+
+/** Pi core work tools a child may be given. Children never get facilitator tools. */
+const CORE_WORK_TOOLS = [
   "read",
   "grep",
   "find",
   "ls",
-  ...MEETING_TOOLS,
+  "edit",
+  "write",
+  "bash",
+  "powershell",
+] as const;
+
+const DEFAULT_CORE_WORK_TOOLS = ["read", "grep", "find", "ls"] as const;
+
+const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
 ];
+
+const DEFAULT_CHILD_TIMEOUT_SECONDS = 900;
+const DEFAULT_MAX_PARALLEL = 4;
+const DEFAULT_MAX_RETRIES = 2;
+
+/** /brainstorm has a fixed three-round protocol. */
+const MAX_BRAINSTORM_ROUNDS = 3;
+
+/** Upper bound for a child wall-clock timeout (seconds). */
+const MAX_CHILD_TIMEOUT_SECONDS = 24 * 60 * 60;
+
+/** Cap on captured child stdout/stderr per attempt. */
+const MAX_CHILD_OUTPUT_CHARS = 400_000;
+
+/** Grace period between SIGTERM and SIGKILL when a child is killed. */
+const CHILD_KILL_GRACE_MS = 5_000;
+
+function isValidTimeoutSeconds(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    value <= MAX_CHILD_TIMEOUT_SECONDS
+  );
+}
+
+function isValidPositiveInt(value: unknown, max: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= max
+  );
+}
 
 // ────────────────────────────────────────────────────────
 // Config helpers
@@ -235,7 +338,9 @@ const DEFAULT_TOOLS = [
 
 /**
  * Deep-merge two values. Arrays are replaced entirely; objects are
- * shallow-merged recursively; scalars use the overlay value.
+ * merged recursively; scalars use the overlay value.
+ *
+ * `participants` is NOT merged by this generic rule — see mergeParticipants.
  */
 function deepMerge(base: any, overlay: any): any {
   if (overlay === null || overlay === undefined) return base;
@@ -251,17 +356,101 @@ function deepMerge(base: any, overlay: any): any {
     !Array.isArray(base) &&
     !Array.isArray(overlay)
   ) {
-    const result: Record<string, any> = { ...base };
+    const result: Record<string, unknown> = { ...base };
     for (const key of Object.keys(overlay)) {
       result[key] =
         key in result
           ? deepMerge(result[key], overlay[key])
-          : overlay[key];
+          : (overlay as Record<string, unknown>)[key];
     }
     return result;
   }
 
   return overlay;
+}
+
+/**
+ * Merge a participant list by identity (`agentName`).
+ *
+ * - overlay entry with an existing agentName  -> deep-merge onto that participant
+ * - overlay entry with a new agentName        -> appended (global order preserved)
+ * - overlay entry with `disabled: true`       -> tombstone that agentName
+ * - global participant no overlay mentions    -> kept as-is
+ *
+ * A tombstone naming an unknown agentName is reported, not fatal.
+ */
+function mergeParticipants(
+  base: unknown[],
+  overlay: unknown[],
+  ignoredTombstones: string[]
+): any[] {
+  const merged = base.map((entry) => ({ ...(entry as any) }));
+  const indexOf = new Map<string, number>();
+  for (let i = 0; i < merged.length; i++) {
+    const name = typeof merged[i].agentName === "string" ? merged[i].agentName.trim() : "";
+    if (name && !indexOf.has(name)) indexOf.set(name, i);
+  }
+
+  for (const raw of overlay) {
+    const entry = { ...(raw as any) };
+    const name = typeof entry.agentName === "string" ? entry.agentName.trim() : "";
+
+    if (!name) {
+      // Missing identity: let validateParticipants report it precisely.
+      merged.push(entry);
+      continue;
+    }
+
+    const at = indexOf.get(name);
+    if (at === undefined) {
+      if (entry.disabled === true) {
+        if (!ignoredTombstones.includes(name)) ignoredTombstones.push(name);
+        continue;
+      }
+      indexOf.set(name, merged.length);
+      merged.push(entry);
+      continue;
+    }
+
+    if (entry.disabled === true) {
+      merged[at] = { ...merged[at], disabled: true };
+      continue;
+    }
+
+    merged[at] = deepMerge(merged[at], entry);
+  }
+
+  return merged.filter((entry) => entry?.disabled !== true);
+}
+
+/**
+ * Merge one config layer. Scalars and objects use deepMerge; `participants`
+ * merges by agentName so a project file patches the global roster instead of
+ * replacing it.
+ */
+function mergeConfigLayer(
+  base: any,
+  overlay: any,
+  ignoredTombstones: string[]
+): any {
+  if (Array.isArray(base?.participants) && Array.isArray(overlay?.participants)) {
+    return {
+      ...deepMerge(base, { ...overlay, participants: undefined }),
+      participants: mergeParticipants(
+        base.participants,
+        overlay.participants,
+        ignoredTombstones
+      ),
+    };
+  }
+
+  const merged = deepMerge(base, overlay);
+  if (Array.isArray(merged.participants)) {
+    merged.participants = merged.participants.filter(
+      (entry: any) => entry?.disabled !== true
+    );
+  }
+  return merged;
 }
 
 /**
@@ -278,18 +467,15 @@ function getExtensionDir(): string {
  *   2. User override: ~/.pi/agent/pi-brainstorm.yaml
  *   3. Project override: {cwd}/.pi-brainstorm.yaml
  *   4. Project override: {cwd}/.pi/pi-brainstorm.yaml
+ *
+ * `participants` merges by agentName across layers: a later layer patches the
+ * participant with the same agentName, new agentNames are added, unmentioned
+ * participants survive, and `disabled: true` tombstones one.
  */
-function hasProjectConfig(cwd: string): boolean {
-  if (!cwd) return false;
-  return [
-    path.join(cwd, ".pi-brainstorm.yaml"),
-    path.join(cwd, ".pi", "pi-brainstorm.yaml"),
-  ].some((candidate) => fs.existsSync(candidate));
-}
-
 function loadConfig(cwd: string): BrainstormConfig {
   const extensionDir = getExtensionDir();
   const packageRoot = path.dirname(extensionDir);
+  const ignoredTombstones: string[] = [];
 
   // Step 1: package/extension defaults
   const defaultCandidates = [
@@ -307,7 +493,7 @@ function loadConfig(cwd: string): BrainstormConfig {
         const raw = fs.readFileSync(candidate, "utf-8");
         const parsed = YAML.parse(raw);
         if (parsed && typeof parsed === "object") {
-          merged = deepMerge(merged, parsed);
+          merged = mergeConfigLayer(merged, parsed, ignoredTombstones);
           loadedAny = true;
         }
       } catch (err: any) {
@@ -331,7 +517,7 @@ function loadConfig(cwd: string): BrainstormConfig {
       const raw = fs.readFileSync(userPath, "utf-8");
       const parsed = YAML.parse(raw);
       if (parsed && typeof parsed === "object") {
-        merged = deepMerge(merged, parsed);
+        merged = mergeConfigLayer(merged, parsed, ignoredTombstones);
       }
     } catch (err: any) {
       throw new Error(
@@ -351,7 +537,7 @@ function loadConfig(cwd: string): BrainstormConfig {
         const raw = fs.readFileSync(candidate, "utf-8");
         const parsed = YAML.parse(raw);
         if (parsed && typeof parsed === "object") {
-          merged = deepMerge(merged, parsed);
+          merged = mergeConfigLayer(merged, parsed, ignoredTombstones);
         }
       } catch (err: any) {
         throw new Error(
@@ -361,6 +547,7 @@ function loadConfig(cwd: string): BrainstormConfig {
     }
   }
 
+  merged.ignoredTombstones = ignoredTombstones;
   return merged as BrainstormConfig;
 }
 
@@ -385,7 +572,6 @@ function validateParticipants(
   const requiredFields: (keyof ParticipantConfig)[] = [
     "displayName",
     "agentName",
-    "model",
     "rolePrompt",
   ];
 
@@ -420,7 +606,12 @@ function validateParticipants(
       );
     }
     seenAgentNames.add(p.agentName);
-    if (typeof p.model !== "string" || !p.model.trim()) {
+    if (p.disabled !== undefined && typeof p.disabled !== "boolean") {
+      throw new Error(
+        `Participant "${p.displayName ?? p.agentName}" has invalid disabled. Use true or false.`
+      );
+    }
+    if (p.model !== undefined && (typeof p.model !== "string" || !p.model.trim())) {
       throw new Error(
         `Participant at ${configKey}[${i}] has invalid model.`
       );
@@ -430,75 +621,320 @@ function validateParticipants(
         `Participant at ${configKey}[${i}] has invalid rolePrompt.`
       );
     }
+    if (
+      p.thinkingLevel !== undefined &&
+      !VALID_THINKING_LEVELS.includes(p.thinkingLevel)
+    ) {
+      throw new Error(
+        `Participant "${p.displayName}" has invalid thinkingLevel "${p.thinkingLevel}". Allowed: ${VALID_THINKING_LEVELS.join(", ")}.`
+      );
+    }
+    if (p.timeoutSeconds !== undefined && !isValidTimeoutSeconds(p.timeoutSeconds)) {
+      throw new Error(
+        `Participant "${p.displayName}" has invalid timeoutSeconds. Use a finite number in (0, ${MAX_CHILD_TIMEOUT_SECONDS}].`
+      );
+    }
   }
 
   return participants;
 }
 
-function resolveParticipants(cwd: string): ParticipantConfig[] {
-  const config = loadConfig(cwd);
-  return validateParticipants(config.participants, "participants");
+
+// ────────────────────────────────────────────────────────
+// Native child runner (headless Pi subprocesses)
+// ────────────────────────────────────────────────────────
+
+type ParticipantState = "ok" | "failed" | "timeout" | "unavailable";
+
+interface ParticipantOutcome {
+  agentName: string;
+  displayName: string;
+  model: string;
+  state: ParticipantState;
+  attempts: number;
+  entryId?: string;
+  entryPath?: string;
+  summary?: string;
+  error?: string;
 }
 
+interface SessionState {
+  kind: SessionKind;
+  topic: string;
+  participants: ParticipantConfig[];
+  config: BrainstormConfig;
+}
 
-// ────────────────────────────────────────────────────────
-// Agent file generation
-// ────────────────────────────────────────────────────────
+/** meetingDir -> session state, so the run tools know who the participants are. */
+const activeSessions = new Map<string, SessionState>();
+
+/** Live child processes, killed on session shutdown. */
+const activeChildren = new Set<ChildProcessWithoutNullStreams>();
 
 /**
- * Generate the content of a managed agent markdown file from a participant config.
+ * Path to this extension file. It is attached to every child (`-e <path>`) so
+ * children can use the blackboard tools: a child only gets the tools this
+ * extension registers, filtered by the `--tools` allowlist.
  */
-function yamlScalar(value: string): string {
-  return JSON.stringify(value);
+function extensionAttachmentPath(config: BrainstormConfig): string {
+  return config.extensionPath ?? path.join(getExtensionDir(), "brainstorm.ts");
 }
 
-function generateAgentFile(participant: ParticipantConfig): string {
-  const baseTools = participant.tools && participant.tools.length > 0
-    ? participant.tools
-    : DEFAULT_TOOLS;
-  // Always include meeting tools even when participant overrides defaults
-  const toolsSet = new Set(baseTools);
-  for (const mt of MEETING_TOOLS) {
-    toolsSet.add(mt);
+/** Core work tools for a child. Facilitator and lab tools are never granted. */
+function participantCoreTools(participant: ParticipantConfig): string[] {
+  const requested = (participant.tools ?? []).filter((tool) =>
+    (CORE_WORK_TOOLS as readonly string[]).includes(tool)
+  );
+  return requested.length > 0 ? requested : [...DEFAULT_CORE_WORK_TOOLS];
+}
+
+function resolveMaxParallel(config: BrainstormConfig): number {
+  return isValidPositiveInt(config.maxParallel, 16) ? config.maxParallel : DEFAULT_MAX_PARALLEL;
+}
+
+function resolveMaxRetries(config: BrainstormConfig): number {
+  return isValidPositiveInt(config.maxRetries, 5) ? config.maxRetries : DEFAULT_MAX_RETRIES;
+}
+
+function resolveTimeoutSeconds(
+  config: BrainstormConfig,
+  participant: ParticipantConfig
+): number {
+  const value =
+    participant.timeoutSeconds ??
+    config.childTimeoutSeconds ??
+    config.subagentTimeoutSeconds;
+  return isValidTimeoutSeconds(value) ? value : DEFAULT_CHILD_TIMEOUT_SECONDS;
+}
+
+/**
+ * Parse a `provider/id[:thinking]` model spec. Model ids may contain `/`
+ * (e.g. `openrouter/z-ai/glm-4.6`), so only the first `/` splits the provider.
+ */
+function parseModelSpec(raw: string): {
+  provider: string;
+  id: string;
+  thinking?: ThinkingLevel;
+} | null {
+  const value = raw.trim();
+  if (!value) return null;
+
+  let rest = value;
+  let thinking: ThinkingLevel | undefined;
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon > -1) {
+    const candidate = rest.slice(lastColon + 1);
+    if ((VALID_THINKING_LEVELS as readonly string[]).includes(candidate)) {
+      thinking = candidate as ThinkingLevel;
+      rest = rest.slice(0, lastColon);
+    }
   }
-  const tools = [...toolsSet];
-  const toolsStr = tools.join(", ");
 
-  const description =
-    participant.description ||
-    `${participant.displayName} brainstorming consultant.`;
+  const slash = rest.indexOf("/");
+  if (slash < 1 || slash === rest.length - 1) return null;
 
-  const roleTitle = participant.roleTitle
-    ? ` - ${participant.roleTitle}`
-    : "";
+  const provider = rest.slice(0, slash);
+  const id = rest.slice(slash + 1);
+  if (!provider || !id || /\s/.test(provider)) return null;
+  return { provider, id, thinking };
+}
 
-  const whatYouDoLines = (participant.whatYouDo && participant.whatYouDo.length > 0)
-    ? participant.whatYouDo.map((item) => `- ${item}`).join("\n")
-    : `- Join the multi-model discussion and provide a ${participant.displayName} perspective`;
+/**
+ * Locate the pi package that this extension was installed alongside. pi is
+ * ESM-only and does not export ./package.json, so `require.resolve` cannot find
+ * it; walk up the directory tree instead.
+ */
+/** Read the `pi` bin entry out of a pi package.json. Returns null if unusable. */
+function piBinFromPackageJson(pkgJson: string): string | null {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgJson, "utf-8"));
+    const binEntry = pkg.bin;
+    let bin: string | undefined;
+    if (typeof binEntry === "string") {
+      bin = binEntry;
+    } else if (binEntry && typeof binEntry.pi === "string") {
+      bin = binEntry.pi;
+    }
+    if (!bin) return null;
+
+    const binPath = path.resolve(path.dirname(pkgJson), bin);
+    return fs.existsSync(binPath) ? binPath : null;
+  } catch {
+    // Malformed package.json.
+    return null;
+  }
+}
+
+function findPiPackageBin(seedDirs: string[]): string | null {
+  for (const seed of seedDirs) {
+    if (!seed) continue;
+    let dir = path.resolve(seed);
+    for (let depth = 0; depth < 8; depth++) {
+      const pkgJson = path.join(
+        dir,
+        "node_modules",
+        "@earendil-works",
+        "pi-coding-agent",
+        "package.json"
+      );
+      if (fs.existsSync(pkgJson)) {
+        const binPath = piBinFromPackageJson(pkgJson);
+        if (binPath) return binPath;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the pi executable used to spawn children. Order: explicit config/env
+ * override, the pi package installed alongside this extension (spawned with the
+ * current Node binary so the child matches the host version), then `pi` on PATH.
+ */
+function resolvePiCommand(config: BrainstormConfig): { command: string; prefixArgs: string[] } {
+  const override = config.piBinary ?? process.env.PI_BRAINSTORM_PI_BIN;
+  if (override) {
+    return isJsEntry(override)
+      ? { command: process.execPath, prefixArgs: [override] }
+      : { command: override, prefixArgs: [] };
+  }
+
+  const seeds = [getExtensionDir(), process.cwd()];
+  const piBin = findPiPackageBin(seeds);
+  if (piBin) return { command: process.execPath, prefixArgs: [piBin] };
+
+  const executable = process.platform === "win32" ? "pi.cmd" : "pi";
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, executable);
+    if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
+  }
+
+  return { command: "pi", prefixArgs: [] };
+}
+
+function isJsEntry(value: string): boolean {
+  return /\.(js|mjs|cjs)$/i.test(value);
+}
+
+interface PreflightResult {
+  ok: boolean;
+  modelArg?: string;
+  thinkingLevel?: ThinkingLevel;
+  reason?: string;
+}
+
+/**
+ * Verify a participant's model can actually run in a child process before
+ * spawning anything: the spec must parse, the model must exist in the
+ * registry, and its provider must have credentials a child can read.
+ */
+function preflightParticipant(
+  ctx: any,
+  participant: ParticipantConfig
+): PreflightResult {
+  const registry = ctx?.modelRegistry;
+
+  if (participant.model) {
+    const spec = parseModelSpec(participant.model);
+    if (!spec) {
+      return {
+        ok: false,
+        reason: `invalid model spec "${participant.model}" (expected provider/id[:thinking])`,
+      };
+    }
+    if (!registry) {
+      return { ok: false, reason: "model registry unavailable; cannot verify model" };
+    }
+    const model = registry.find(spec.provider, spec.id);
+    if (!model) {
+      return {
+        ok: false,
+        reason: `model ${spec.provider}/${spec.id} not found (check \`pi --list-models\`)`,
+      };
+    }
+    if (registry.hasConfiguredAuth && !registry.hasConfiguredAuth(model)) {
+      const status = registry.getProviderAuthStatus?.(spec.provider);
+      const source = status?.source ?? "none";
+      return {
+        ok: false,
+        reason:
+          `provider ${spec.provider} has no credentials a child process can read ` +
+          `(auth source: ${source}). Configure stored or environment credentials.`,
+      };
+    }
+    const thinkingLevel =
+      participant.thinkingLevel ?? spec.thinking;
+    return {
+      ok: true,
+      modelArg: `${spec.provider}/${spec.id}`,
+      thinkingLevel,
+    };
+  }
+
+  const mainModel = ctx?.model;
+  if (!mainModel) {
+    return { ok: false, reason: "no model configured and no main model to inherit" };
+  }
+  const inherited = participant.thinkingLevel ?? ctx?.thinkingLevel;
+  return {
+    ok: true,
+    modelArg: `${mainModel.provider}/${mainModel.id}`,
+    thinkingLevel: inherited,
+  };
+}
+
+/** The role text a participant carries into its child's system prompt. */
+function participantRoleText(
+  participant: ParticipantConfig,
+  mode: "brainstorm" | "debate" | "lab"
+): string {
+  if (mode === "debate" && participant.debatePersona?.prompt) {
+    return participant.debatePersona.prompt.trim();
+  }
+  return participant.rolePrompt.trim();
+}
+
+/**
+ * Build the per-participant role brief passed to the child through
+ * `--append-system-prompt`. This replaces the old agent markdown files: it is
+ * regenerated per round inside the meeting folder and is not a global catalog.
+ */
+function buildRoleBrief(
+  participant: ParticipantConfig,
+  mode: "brainstorm" | "debate" | "lab"
+): string {
+  const roleTitle = participant.roleTitle ? ` — ${participant.roleTitle}` : "";
+  const focusItems = participant.whatYouDo?.length
+    ? participant.whatYouDo
+    : ["Join the multi-agent discussion and provide a distinctive perspective"];
+  const coreTools = participantCoreTools(participant);
+  const readOnly = coreTools.every(
+    (tool) => tool === "read" || tool === "grep" || tool === "find" || tool === "ls"
+  );
+
+  const notDo = [
+    readOnly
+      ? "Never write code or modify project files; you only read them"
+      : "Only modify files when your round mission explicitly asks you to",
+    "Never delegate to other agents and never spawn sub-agents",
+    "Never paste long analyses into chat; write your FULL contribution with " +
+      "meeting_append_entry, then reply only with WROTE_ENTRY plus a one-sentence summary",
+  ];
 
   return [
-    "---",
-    `name: ${yamlScalar(participant.agentName)}`,
-    `description: ${yamlScalar(description)}`,
-    `tools: ${toolsStr}`,
-    `model: ${yamlScalar(participant.model)}`,
-    "---",
+    `# ${participant.displayName} (${participant.agentName})${roleTitle}`,
     "",
-    MANAGED_MARKER,
-    "",
-    `# ${participant.displayName} Brainstormer${roleTitle}`,
-    "",
-    participant.rolePrompt,
+    participantRoleText(participant, mode),
     "",
     "## What You Do",
-    whatYouDoLines,
+    focusItems.map((item) => `- ${item}`).join("\n"),
     "",
     "## What You Do Not Do",
-    "- Never write code or modify project files; you only read them",
-    "- Never delegate to other agents",
-    "- Never paste long analyses into chat; when told to use " +
-      "meeting_append_entry, write your FULL contribution to the meeting " +
-      "blackboard and reply only with WROTE_ENTRY plus a one-sentence summary",
+    notDo.map((item) => `- ${item}`).join("\n"),
     "",
     "## Worker Preamble",
     "You are a terminal worker. Work directly with tools. Do NOT spawn sub-agents.",
@@ -506,160 +942,579 @@ function generateAgentFile(participant: ParticipantConfig): string {
   ].join("\n");
 }
 
-/**
- * Ensure agent files exist for all configured participants.
- * - Files with the managed marker are overwritten from current config.
- * - Files without the marker are never touched.
- * - Missing files are created after user confirmation.
- *
- * Returns true if all participants have existing agent files (managed or not).
- */
-async function safeWriteAgentFile(targetPath: string, content: string, mode: "create" | "update"): Promise<void> {
-  const dir = path.dirname(targetPath);
-  assertDirectoryNoSymlink(dir, "agents directory");
-  assertPathInside(fs.realpathSync(dir), path.resolve(targetPath), "agent file");
+/** Write the role brief for one participant and return its path. */
+async function writeRoleBrief(
+  absDir: string,
+  participant: ParticipantConfig,
+  mode: "brainstorm" | "debate" | "lab"
+): Promise<string> {
+  const rolesDir = path.join(absDir, "roles");
+  await fsp.mkdir(rolesDir, { recursive: true });
+  assertDirectoryNoSymlink(rolesDir, "roles directory");
 
-  if (mode === "create") {
-    await fsp.writeFile(targetPath, content, { encoding: "utf-8", flag: "wx" });
-    return;
-  }
-
-  assertExistingFileNoSymlink(targetPath, "agent file");
-  const tempPath = path.join(
-    dir,
-    `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`
-  );
-  await fsp.writeFile(tempPath, content, { encoding: "utf-8", flag: "wx" });
-  try {
-    await fsp.rename(tempPath, targetPath);
-  } catch (err) {
-    try {
-      await fsp.unlink(tempPath);
-    } catch {
-      // Ignore cleanup errors.
-    }
-    throw err;
-  }
+  const briefPath = path.join(rolesDir, `${participant.agentName}.md`);
+  assertWritableFilePath(briefPath, absDir, "participant role brief");
+  await fsp.writeFile(briefPath, buildRoleBrief(participant, mode), "utf-8");
+  return briefPath;
 }
 
-async function ensureAgentsFromConfig(
-  ctx: any,
-  participants: ParticipantConfig[],
-  options: { allowGlobalWrites: boolean }
-): Promise<boolean> {
-  const agentsDir = path.join(getAgentDir(), "agents");
+/** The self-contained task handed to one participant child. */
+function buildParticipantTask(options: {
+  participant: ParticipantConfig;
+  topic: string;
+  absDir: string;
+  phase: string;
+  mission: string;
+  priorContext: "none" | "read";
+  retryNote?: string;
+}): string {
+  const { participant, topic, absDir, phase, mission, priorContext, retryNote } = options;
 
-  const planned: { filename: string; action: "create" | "update" }[] = [];
-  const protectedFiles: string[] = [];
+  const priorStep =
+    priorContext === "none"
+      ? "There are no prior entries to read for this phase."
+      :
+      "First call meeting_read_index({ meetingDir }) on the meeting directory, then " +
+      "meeting_read_entry({ meetingDir, entryPath }) for the entries you need, and " +
+      "respond to them. Never invent prior contributions you have not read.";
 
-  for (const p of participants) {
-    const filename = `${p.agentName}.md`;
-    const targetPath = path.resolve(agentsDir, filename);
-    assertPathInside(agentsDir, targetPath, "agent file");
+  return [
+    `You are the participant "${participant.displayName}" (${participant.agentName}) in a multi-agent session.`,
+    "Your role brief is already in your system prompt; follow it exactly.",
+    "",
+    `Topic: ${topic}`,
+    `Meeting blackboard directory: ${absDir}`,
+    `Phase: ${phase}`,
+    "",
+    `MISSION: ${mission}`,
+    "",
+    `PRIOR CONTEXT: ${priorStep}`,
+    "",
+    "STEPS:",
+    "1. Read any prior context from the blackboard (see PRIOR CONTEXT above).",
+    "2. Write your FULL contribution with meeting_append_entry:",
+    "   meeting_append_entry({",
+    `     meetingDir: "${absDir}",`,
+    `     speaker: "${participant.displayName}",`,
+    `     phase: "${phase}",`,
+    '     summary: "<one sentence>",',
+    '     content: "<your complete analysis — in the user\'s language, default English>"',
+    "   })",
+    "3. Reply with ONLY: WROTE_ENTRY: <your one-sentence summary>",
+    "",
+    "RULES:",
+    "- Write your FULL analysis to the blackboard, never to the chat.",
+    "- Do not include wrapper tags, hidden thinking markers, or tool-call text inside content.",
+    "- Do not delegate or spawn sub-agents.",
+    "- Finish your contribution and return; do not ask questions.",
+    retryNote ? `\nNOTE: ${retryNote}` : "",
+  ].join("\n");
+}
 
-    if (fs.existsSync(targetPath)) {
-      assertExistingFileNoSymlink(targetPath, "agent file");
-      const content = fs.readFileSync(targetPath, "utf-8");
-      if (content.includes(MANAGED_MARKER)) {
-        planned.push({ filename, action: "update" });
-      } else {
-        protectedFiles.push(filename);
-      }
-    } else {
-      planned.push({ filename, action: "create" });
-    }
-  }
-
-  // If nothing to create or update, we're done
-  if (planned.length === 0) {
-    return true;
-  }
-
-  if (!options.allowGlobalWrites) {
-    ctx.ui?.notify?.(
-      "Project-level pi-brainstorm config is active. For safety, this command will not create or update global agent files. Create the listed agents manually or move the config to ~/.pi/agent/pi-brainstorm.yaml.",
-      "warning"
+/** Default mission text for a round/cycle when the facilitator supplies none. */
+function defaultMission(
+  mode: "brainstorm" | "debate" | "lab",
+  unitLabel: string,
+  unitNumber: number,
+  topic: string,
+  isFinal: boolean
+): string {
+  if (mode === "debate") {
+    return (
+      `Read the full debate record, then advance your position: attack the weakest ` +
+      `point you can find in the other participants' entries, defend your own ` +
+      `position against the strongest objection so far, and concede explicitly where ` +
+      `you are wrong. Topic: ${topic}.`
     );
-    return false;
   }
-
-  // Non-interactive mode
-  if (!ctx.hasUI) {
-    // Update managed files silently
-    await fsp.mkdir(agentsDir, { recursive: true });
-    assertDirectoryNoSymlink(agentsDir, "agents directory");
-    for (const plan of planned) {
-      if (plan.action === "update") {
-        const p = participants.find(
-          (p) => `${p.agentName}.md` === plan.filename
-        )!;
-        const targetPath = path.resolve(agentsDir, plan.filename);
-        assertPathInside(agentsDir, targetPath, "agent file");
-        await safeWriteAgentFile(
-          targetPath,
-          generateAgentFile(p),
-          "update"
-        );
-      }
-    }
-    // Report missing
-    const missing = planned.filter((p) => p.action === "create");
-    if (missing.length > 0) {
-      ctx.ui?.notify?.(
-        `Missing meeting agents: ${missing.map((m) => m.filename).join(", ")}. Install them under ${agentsDir}.`,
-        "warning"
-      );
-      return false;
-    }
-    return true;
+  if (unitNumber <= 1) {
+    return `Give your independent initial analysis of: ${topic}. Cover assumptions, options, risks, and what you would actually do.`;
   }
-
-  // Interactive mode: ask user
-  let message = "";
-  if (planned.length > 0) {
-    const actionWord = planned.some((p) => p.action === "update")
-      ? "created/updated"
-      : "created";
-    message += `The following agent files will be ${actionWord}:\n`;
-    for (const p of planned) {
-      message += `  - ${p.filename} (${p.action})\n`;
-    }
+  if (isFinal) {
+    return (
+      `Read every prior entry, then give your FINAL recommendation for: ${topic}. ` +
+      `Synthesize the best ideas from the other participants, keep what survives ` +
+      `criticism, and state what you changed your mind about.`
+    );
   }
-  if (protectedFiles.length > 0) {
-    message += `\nThe following existing files are NOT managed by pi-brainstorm and will be left untouched:\n`;
-    for (const f of protectedFiles) {
-      message += `  - ${f}\n`;
-    }
-  }
-
-  const title = planned.some((p) => p.action === "update")
-    ? "Update brainstorm agents?"
-    : "Install brainstorm agents?";
-
-  const ok = await ctx.ui.confirm(
-    title,
-    message + `\nFiles will be written to ${agentsDir}.`
+  return (
+    `Read the ${unitLabel} ${unitNumber - 1} entries, then challenge the other ` +
+    `participants' positions and improve your own for: ${topic}. Be specific about ` +
+    `which entry you are responding to.`
   );
-  if (!ok) return false;
+}
 
-  await fsp.mkdir(agentsDir, { recursive: true });
-  assertDirectoryNoSymlink(agentsDir, "agents directory");
-  for (const plan of planned) {
-    const p = participants.find(
-      (p) => `${p.agentName}.md` === plan.filename
-    )!;
-    const targetPath = path.resolve(agentsDir, plan.filename);
-    assertPathInside(agentsDir, targetPath, "agent file");
-    await safeWriteAgentFile(targetPath, generateAgentFile(p), plan.action);
+interface ChildRunResult {
+  state: "ok" | "timeout" | "failed";
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  error?: string;
+}
+
+/** Run one headless pi child to completion, timeout, or failure. */
+function runChildPi(options: {
+  command: string;
+  args: string[];
+  cwd: string;
+  timeoutSeconds: number;
+}): Promise<ChildRunResult> {
+  const { command, args, cwd, timeoutSeconds } = options;
+
+  return new Promise<ChildRunResult>((resolve) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err: any) {
+      resolve({
+        state: "failed",
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        error: `spawn failed: ${err?.message ?? String(err)}`,
+      });
+      return;
+    }
+
+    activeChildren.add(child);
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+
+    const append = (current: string, chunk: Buffer | string): string => {
+      const next = current + String(chunk);
+      return next.length > MAX_CHILD_OUTPUT_CHARS ? next.slice(0, MAX_CHILD_OUTPUT_CHARS) : next;
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+    });
+
+    const killChild = () => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Already gone.
+      }
+      const hardKill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, CHILD_KILL_GRACE_MS);
+      hardKill.unref();
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChild();
+    }, timeoutSeconds * 1000);
+    timer.unref();
+
+    const finish = (result: ChildRunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      activeChildren.delete(child);
+      resolve(result);
+    };
+
+    child.on("error", (err) => {
+      finish({
+        state: "failed",
+        stdout,
+        stderr,
+        exitCode: null,
+        error: `child error: ${err.message}`,
+      });
+    });
+
+    child.on("close", (code) => {
+      if (timedOut) {
+        finish({
+          state: "timeout",
+          stdout,
+          stderr,
+          exitCode: code,
+          error: `timed out after ${timeoutSeconds}s`,
+        });
+        return;
+      }
+      if (code === 0) {
+        finish({ state: "ok", stdout, stderr, exitCode: code });
+        return;
+      }
+      finish({
+        state: "failed",
+        stdout,
+        stderr,
+        exitCode: code,
+        error: `child exited with code ${code}`,
+      });
+    });
+  });
+}
+
+/** Read index.jsonl entries for a meeting. Returns [] when absent or unreadable. */
+async function readIndexEntries(absDir: string): Promise<any[]> {
+  try {
+    const raw = await fsp.readFile(path.join(absDir, "index.jsonl"), "utf-8");
+    return raw
+      .split("\n")
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Run one participant to completion with retries. Success requires: exit 0,
+ * a `WROTE_ENTRY` marker in the child's output, and a NEW index entry for
+ * this speaker+phase.
+ */
+async function runParticipant(options: {
+  ctx: any;
+  config: BrainstormConfig;
+  participant: ParticipantConfig;
+  mode: "brainstorm" | "debate" | "lab";
+  absDir: string;
+  topic: string;
+  phase: string;
+  mission: string;
+  priorContext: "none" | "read";
+}): Promise<ParticipantOutcome> {
+  const { ctx, config, participant, mode, absDir, topic, phase, mission, priorContext } = options;
+
+  const base: ParticipantOutcome = {
+    agentName: participant.agentName,
+    displayName: participant.displayName,
+    model: participant.model ?? "(inherit main model)",
+    state: "failed",
+    attempts: 0,
+  };
+
+  const ready = preflightParticipant(ctx, participant);
+  const modelArg = ready.modelArg;
+  if (!ready.ok || !modelArg) {
+    return {
+      ...base,
+      state: "unavailable",
+      error: ready.reason ?? "model preflight failed",
+    };
+  }
+  base.model = modelArg;
+
+  const piCommand = resolvePiCommand(config);
+  const extPath = extensionAttachmentPath(config);
+  if (!fs.existsSync(extPath)) {
+    return {
+      ...base,
+      state: "unavailable",
+      error: `cannot find the pi-brainstorm extension to attach: ${extPath}`,
+    };
   }
 
-  ctx.ui.notify(`Updated ${planned.length} agent file(s).`, "info");
-  return true;
+  let briefPath: string;
+  try {
+    briefPath = await writeRoleBrief(absDir, participant, mode);
+  } catch (err: any) {
+    return { ...base, state: "unavailable", error: `role brief failed: ${err.message}` };
+  }
+
+  const tools = [
+    ...new Set([...participantCoreTools(participant), ...MEETING_TOOLS]),
+  ];
+  const timeoutSeconds = resolveTimeoutSeconds(config, participant);
+  const maxRetries = resolveMaxRetries(config);
+  const projectTrusted =
+    typeof ctx?.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;
+
+  let lastError = "";
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    const entriesBefore = await readIndexEntries(absDir);
+
+    const task = buildParticipantTask({
+      participant,
+      topic,
+      absDir,
+      phase,
+      mission,
+      priorContext,
+      retryNote:
+        attempt > 1
+          ? `PREVIOUS ATTEMPT FAILED (${lastError || "unknown error"}). This is retry ${
+              attempt - 1
+            } of ${maxRetries}. Complete your contribution and end with WROTE_ENTRY.`
+          : undefined,
+    });
+
+    const args = [
+      ...piCommand.prefixArgs,
+      "--print",
+      "--no-session",
+      "--model",
+      modelArg,
+      "--tools",
+      tools.join(","),
+      "--append-system-prompt",
+      briefPath,
+      "-e",
+      extPath,
+      projectTrusted ? "--approve" : "--no-approve",
+    ];
+    if (ready.thinkingLevel) args.push("--thinking", ready.thinkingLevel);
+    args.push("--", task);
+
+    const run = await runChildPi({
+      command: piCommand.command,
+      args,
+      cwd: ctx.cwd,
+      timeoutSeconds,
+    });
+
+    const entriesAfter = await readIndexEntries(absDir);
+    const newEntry = entriesAfter
+      .slice(entriesBefore.length)
+      .find((entry) => entry?.speaker === participant.displayName && entry?.phase === phase);
+
+    const wroteMarker = run.stdout.includes("WROTE_ENTRY");
+
+    if (run.state === "ok" && wroteMarker && newEntry) {
+      return {
+        ...base,
+        state: "ok",
+        attempts: attempt,
+        entryId: newEntry.id,
+        entryPath: newEntry.path,
+        summary: typeof newEntry.summary === "string" ? newEntry.summary : "(no summary)",
+      };
+    }
+
+    if (run.state === "timeout") {
+      lastError = run.error ?? `timed out after ${timeoutSeconds}s`;
+    } else if (wroteMarker && !newEntry) {
+      lastError = "child reported WROTE_ENTRY but no matching index entry landed";
+    } else if (run.exitCode !== 0) {
+      lastError = run.error ?? `child exited with code ${run.exitCode}`;
+    } else {
+      lastError =
+        run.stderr.trim().slice(0, 300) ||
+        run.error ||
+        "child finished without a WROTE_ENTRY marker";
+    }
+
+    if (attempt <= maxRetries) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5_000));
+    }
+  }
+
+  return { ...base, state: lastError.includes("timed out") ? "timeout" : "failed", error: lastError };
 }
+
+/** Run participants with a concurrency cap, preserving input order in results. */
+async function runParticipantsParallel<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<ParticipantOutcome>
+): Promise<ParticipantOutcome[]> {
+  const results: ParticipantOutcome[] = [];
+  let next = 0;
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < workerCount; w++) {
+    workers.push(
+      (async (): Promise<void> => {
+        for (;;) {
+          const index = next++;
+          if (index >= items.length) return;
+          results[index] = await fn(items[index]);
+        }
+      })()
+    );
+  }
+
+  await Promise.all(workers);
+  return results;
+}
+
+function formatOutcomes(
+  outcomes: ParticipantOutcome[],
+  unitLabel: string,
+  unitNumber: number
+): string {
+  const ok = outcomes.filter((o) => o.state === "ok");
+  const bad = outcomes.filter((o) => o.state !== "ok");
+
+  const lines = [
+    `${unitLabel} ${unitNumber}: ${ok.length}/${outcomes.length} participants wrote entries.`,
+    "",
+    ...ok.map(
+      (o) =>
+        `  ✅ ${o.displayName} (${o.agentName}) [${o.model}] entry ${o.entryId}: ${o.summary}`
+    ),
+    ...bad.map(
+      (o) =>
+        `  ❌ ${o.displayName} (${o.agentName}) [${o.model}] ${o.state.toUpperCase()}` +
+        `${o.attempts ? ` after ${o.attempts} attempt(s)` : ""}: ${o.error ?? "unknown error"}`
+    ),
+    "",
+    bad.length
+      ? "Failed participants did not write an entry. Do NOT invent their content. Present them as \"did not respond\" and continue."
+      : "All participants wrote their entries.",
+  ];
+
+  return lines.join("\n");
+}
+
+interface RosterResult {
+  ok: boolean;
+  config?: BrainstormConfig;
+  participants?: ParticipantConfig[];
+  topic?: string;
+  error?: string;
+}
+
+/** Resolve the roster for a meeting directory, falling back to the config. */
+async function resolveSessionParticipants(
+  ctx: any,
+  absDir: string,
+  selector?: string[]
+): Promise<RosterResult> {
+  let config: BrainstormConfig;
+  try {
+    config = loadConfig(ctx.cwd);
+  } catch (err: any) {
+    return { ok: false, error: `config error: ${err.message}` };
+  }
+
+  const session = activeSessions.get(absDir);
+  let pool: ParticipantConfig[];
+  try {
+    pool = session
+      ? session.participants
+      : validateParticipants(config.participants, "participants");
+    const participants = selector ? selectParticipants(pool, selector) : pool;
+
+    let topic = session?.topic;
+    if (!topic) {
+      const manifest = await readManifest(absDir);
+      topic = manifest?.topic ?? "the meeting topic";
+    }
+
+    return { ok: true, config, participants, topic };
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/** Build a standard tool error result. */
+function toolError(text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {},
+    isError: true,
+  };
+}
+
+/**
+ * Shared delegation guide injected into every facilitator prompt. Delegation is
+ * done by these extension tools, not by a subagent extension: the facilitator
+ * never pastes role text or spawn options.
+ */
+function buildNativeRunnerGuide(
+  config: BrainstormConfig,
+  participants: ParticipantConfig[],
+  mode: "brainstorm" | "debate" | "lab"
+): string[] {
+  const roster = participants
+    .map(
+      (p) =>
+        `- **${p.displayName}** — agentName \`${p.agentName}\` — model \`${
+          p.model ?? "inherit main model"
+        }\``
+    )
+    .join("\n");
+
+  const isDebate = mode === "debate";
+  const maxParallel = isDebate ? 1 : resolveMaxParallel(config);
+  const maxRetries = resolveMaxRetries(config);
+
+  return [
+    "## PARTICIPANT EXECUTION (native headless Pi children)",
+    "",
+    "Participants run as headless Pi child processes that this extension spawns and",
+    "supervises. You do NOT write their prompts, roles, models, or tool lists, and you",
+    "must NOT paste participant text into a task. Call the run tool for the unit:",
+    "",
+    isDebate
+      ? "```js\nmeeting_run_cycle({ meetingDir: \"<MEETING_DIR>\", cycle: 1, agentName: \"<agentName>\" })\n```"
+      : "```js\nmeeting_run_round({ meetingDir: \"<MEETING_DIR>\", round: 1 })\n```",
+    "",
+    isDebate
+      ? "`meeting_run_cycle` runs ONE participant at a time (a debater must see every prior entry). Run it once per debater per cycle."
+      : `\`meeting_run_round\` runs ALL participants in parallel (up to ${maxParallel} at a time), each reading prior entries from the blackboard itself.`,
+    "",
+    `Each attempt is bounded by a wall-clock timeout (default ${DEFAULT_CHILD_TIMEOUT_SECONDS}s) and retried up to ${maxRetries} time(s) inside the tool.`,
+    "Each child gets: its role brief in the system prompt, a self-contained task, its",
+    "configured model, and only `read/grep/find/ls` plus `meeting_append_entry`,",
+    "`meeting_read_index`, `meeting_read_entry`. Facilitator and lab tools stay with you.",
+    "",
+    "The tool returns one line per participant with state `ok`, `failed`, `timeout`, or",
+    "`unavailable`, plus the entry id and summary. Never fabricate a missing participant's content.",
+    "",
+    "### Roster",
+    roster,
+    "",
+  ];
+}
+
 
 // ────────────────────────────────────────────────────────
 // Prompt builders
 // ────────────────────────────────────────────────────────
+
+/** Shared failure-handling block for participant runs. */
+function failureHandlingSection(
+  unit: "round" | "cycle",
+  actor: "consultant" | "debater"
+): string[] {
+  return [
+    "## FAILURE HANDLING",
+    `The run tool already retried each ${actor} (default 3 attempts) and reports one state per participant.`,
+    "",
+    "### Reading the result",
+    `- \`ok\` — the ${actor} wrote an entry; the entry id and summary are returned.`,
+    "- `failed` — the child errored or never wrote an entry, after all retries.",
+    "- `timeout` — the child hit its wall-clock timeout and was killed.",
+    "- `unavailable` — the participant's model could not be verified or authenticated; no child was spawned.",
+    "",
+    "### What you do next",
+    `- Do NOT re-run a whole ${unit} because one ${actor} failed.`,
+    "- Proceed with the participants who succeeded, and mark the rest as \"[displayName] ([agentName]): did not respond\".",
+    `- You MAY re-run a single ${actor} with \`participants: [\"<agentName>\"]\` when the failure looks transient (rate limit, network).`,
+    `- If the same ${actor} fails in 2 consecutive ${unit}s, warn the user with the real display name and model.`,
+    `- Continue to the next ${unit} normally — do not drop them permanently; they may recover.`,
+    "",
+    "### NEVER do this",
+    `- Do NOT fabricate or simulate a ${actor}'s response.`,
+    "- Do NOT paste participant full text into chat; it is on the blackboard.",
+    `- Do NOT abort the entire session because one ${actor} failed.`,
+    "",
+  ];
+}
 
 /**
  * Build the facilitator prompt for /brainstorm.
@@ -667,19 +1522,15 @@ async function ensureAgentsFromConfig(
 function buildBrainstormPrompt(
   topic: string,
   absDir: string,
+  config: BrainstormConfig,
   participants: ParticipantConfig[]
 ): string {
   const consultantLines = participants
     .map(
       (p) =>
-        `- **${p.displayName}**: use the ${p.agentName} subagent. ${p.brainstormRole || p.roleTitle || "Consultant"}.`
-    )
-    .join("\n");
-
-  const agentTaskLines = participants
-    .map(
-      (p) =>
-        `   - speaker: "${p.displayName}"`
+        `- **${p.displayName}** (${p.agentName}) [${p.model ?? "inherit main model"}]: ${
+          p.brainstormRole || p.roleTitle || "Consultant"
+        } — run with meeting_run_round.`
     )
     .join("\n");
 
@@ -694,91 +1545,38 @@ function buildBrainstormPrompt(
     "## Consultants (3 rounds)",
     consultantLines,
     "",
+    ...buildNativeRunnerGuide(config, participants, "brainstorm"),
+    "",
     "## PRE-ROUND STEP — Assign a Human-Readable Title",
     "",
     `Before Round 1, choose a concise human-readable meeting title for "${topic}" and call:`,
     `  meeting_rename({ meetingDir: "${absDir}", title: "<your concise title>" })`,
     "",
-    "Use the returned `newMeetingDir` for ALL subsequent meeting tools and subagent tasks. If rename fails, continue with the original meetingDir.",
+    "Use the returned `newMeetingDir` for ALL subsequent meeting tools. If rename fails, continue with the original meetingDir.",
+    "After renaming, replace every `<MEETING_DIR>` placeholder in the task template with the current meeting directory.",
     "",
     "## CRITICAL INSTRUCTIONS",
     "",
-    "### Blackboard-first — do NOT paste prior participant text into subagent tasks",
+    "### Blackboard-first — the blackboard is the single source of truth",
     "",
-    "The meeting blackboard is the single source of truth. Subagent tasks must direct participants to READ from the blackboard, not receive pasted history.",
+    "You never paste participant text into a participant task. `meeting_run_round` tells each child to read prior entries from the blackboard itself.",
     "",
-    "- Round 1: subagents write initial analysis. No prior entries to read.",
-    "- Round 2: tell subagents to call meeting_read_index and meeting_read_entry on the current meetingDir to read Round 1 entries before responding.",
-    "- Round 3: tell subagents to call meeting_read_index and meeting_read_entry to read ALL prior round entries AND any User feedback entries from the blackboard.",
-    "- User feedback: if the user provides feedback that exists only in chat, APPEND it to the blackboard as `speaker: \"User\", phase: \"Feedback after Round N\"`, then tell participants to read it from the blackboard.",
+    "- Round 1: participants write initial analysis. There are no prior entries to read.",
+    "- Round 2: children read Round 1 entries from the blackboard before responding.",
+    "- Round 3: children read ALL prior round entries AND any User feedback entries.",
+    '- User feedback: if the user gives feedback that exists only in chat, APPEND it to the blackboard first with `meeting_append_entry({ speaker: "User", phase: "Feedback after Round N", summary, content })`, then run the next round.',
     "",
-    "### For subagents (include in EVERY task):",
-    "1. When the task asks for prior context, read it from the blackboard using meeting_read_index and meeting_read_entry. Round 1 has no prior entries to read.",
-    "2. Write your FULL contribution using the meeting_append_entry tool with:",
-    `   - meetingDir: the current meetingDir (use the one returned by meeting_rename if rename succeeded)`,
-    "   - speaker: your display name, e.g.:",
-    agentTaskLines,
-    '   - phase: "Round 1", "Round 2", or "Round 3"',
-    "   - summary: a ONE-SENTENCE summary of your contribution",
-    "   - content: your FULL analysis (in the user's language, default English)",
-    "   - content must contain only the participant's analysis. Do not include wrapper tags, hidden thinking markers, tool-call text, or WROTE_ENTRY text inside content.",
-    "3. After writing, your FINAL ANSWER must be ONLY:",
-    "   `WROTE_ENTRY: <your one-sentence summary>`",
-    "4. DO NOT paste your full analysis into the chat. The main agent and user will read it from the blackboard.",
+    "### Running a round",
+    "1. `meeting_run_round({ meetingDir: \"<current meetingDir>\", round: 1 })` — runs every participant in parallel, retries failures, and returns one line per participant.",
+    "2. Read the returned states. `ok` lines include the entry id and one-sentence summary.",
+    "3. `meeting_read_index({ meetingDir })` to confirm what landed, then present your structural overview.",
     "",
-    "### For you, the facilitator:",
-    "- Do NOT paste participant full text into chat. They are on the blackboard.",
-    "- Do NOT paste prior round content into subagent tasks. Tell subagents to read the blackboard.",
-    "- After each round, read the index with meeting_read_index and present a structural overview.",
-    "- Optionally read full entries with meeting_read_entry when needed.",
-    "- Present each consultant's summary + your structural overview (conflict matrix, consensus table).",
-    "- When the user gives feedback, append it to the blackboard as a User entry, then tell participants to read it.",
+    "Rounds 2 and 3 are the same call with a higher `round`. Optional `mission` overrides the default round mission; optional `participants: [\"<agentName>\", ...]` narrows the round to a subset.",
     "",
-    "## Protocol",
-    "Round 1: Each consultant gives initial analysis on the topic. Run all in parallel. Subagents do not need to read prior entries.",
-    "After Round 1: read the index, present summaries plus a structural overview, then STOP. Ask the user for feedback or permission to continue. Do NOT start Round 2 in the same assistant turn.",
-    "Round 2: only after the user replies, tell each subagent to call meeting_read_index and meeting_read_entry to read Round 1 entries, then challenge the others and propose improvements. If user feedback exists, append it to the blackboard first.",
-    "After Round 2: read the index, present summaries plus an updated structural overview, then STOP. Ask the user for feedback or permission to continue. Do NOT start Round 3 in the same assistant turn.",
-    "Round 3: only after the user replies, tell each subagent to read ALL prior round entries AND user feedback entries from the blackboard (via meeting_read_index and meeting_read_entry). Each gives FINAL recommendation, synthesizing the best ideas.",
-    "",
-    "After Round 3, present the complete structural overview and ask whether to write the final conclusion. Only write conclusion.md after the user confirms.",
-    "",
-    "## FAILURE HANDLING",
-    "Subagent calls can fail (timeout, API error, model unavailable, crash). You MUST detect and handle failures:",
-    "",
-    "### Detecting failure",
-    "A subagent call has FAILED if:",
-    "- The tool result contains error text (\"error\", \"failed\", \"timeout\", \"unavailable\", \"connection\", etc.)",
-    "- The subagent returns no output or empty output",
-    "- The subagent output does NOT contain \"WROTE_ENTRY:\" (the expected success marker)",
-    "- The subagent produced no meeting_append_entry call (check with meeting_read_index after the parallel batch)",
-    "",
-    "### Retry strategy",
-    "When you detect a failure:",
-    "1. Wait 5-10 seconds before retrying (API rate limits may have triggered the failure)",
-    "2. Retry the SAME consultant with the SAME task up to 2 more times (3 attempts total)",
-    "3. On retry, add to the task: \"PREVIOUS ATTEMPT FAILED. This is retry N of 2. Focus only on completing your contribution and writing WROTE_ENTRY.\"",
-    "4. If the consultant succeeds on retry, proceed normally",
-    "5. If ALL retries are exhausted, treat this consultant as UNAVAILABLE for this round",
-    "",
-    "### When a consultant is UNAVAILABLE",
-    "- Do NOT wait indefinitely or freeze the session",
-    "- Proceed with the remaining consultants who succeeded",
-    "- In your structural overview, clearly mark the failed participant as: " +
-      "\"[displayName] ([agentName]): did not respond\"",
-    "- Continue to the next round normally — do NOT skip the consultant in future rounds (they may recover)",
-    "- If the same consultant fails in 2 consecutive rounds, warn the user " +
-      "with the real display name, e.g.: \"GPT-Critic failed in 2 " +
-      "consecutive rounds; check whether that model is available\"",
-    "",
-    "### NEVER do this",
-    "- Do NOT fabricate or simulate a consultant's response",
-    "- Do NOT impose an extra manual timeout beyond the subagent tool's timeout; if the tool reports timeout, treat that attempt as failed",
-    "- Do NOT abort the entire session because one consultant failed",
-    "",
+    ...failureHandlingSection("round", "consultant"),
     "## IMPORTANT",
     "- Respond in the language the user uses; default to English.",
-    "- Save transcript.md and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
+    "- Save `transcript.md` and, after the user confirms, `conclusion.md`.",
     "- The user can intervene at any time to steer the discussion.",
   ].join("\n");
 }
@@ -789,34 +1587,17 @@ function buildBrainstormPrompt(
 function buildDebatePrompt(
   topic: string,
   absDir: string,
+  config: BrainstormConfig,
   participants: ParticipantConfig[]
 ): string {
   const debaterLines = participants
     .map((p) => {
-      const dp = p.debatePersona;
-      if (dp) {
-        return `- **${p.displayName}** (${p.agentName}): ${dp.label} — Attack other positions, find flaws, expose assumptions.`;
+      const persona = p.debatePersona;
+      if (persona) {
+        return `- **${p.displayName}** (${p.agentName}): ${persona.label} — attack other positions, find flaws, expose assumptions.`;
       }
       return `- **${p.displayName}** (${p.agentName})`;
     })
-    .join("\n");
-
-  // Build per-agent debate task prefixes for the facilitator to include
-  const taskPrefixLines = participants
-    .map((p) => {
-      const dp = p.debatePersona;
-      if (dp && dp.prompt) {
-        return `**${p.displayName}** (${p.agentName}):\n${dp.prompt}`;
-      }
-      return `**${p.displayName}** (${p.agentName}): Debate participant.`;
-    })
-    .join("\n\n");
-
-  const agentTaskLines = participants
-    .map(
-      (p) =>
-        `   - speaker: "${p.displayName}"`
-    )
     .join("\n");
 
   return [
@@ -831,94 +1612,40 @@ function buildDebatePrompt(
     "## Debaters (cycling indefinitely)",
     debaterLines,
     "",
-    "## DEBATE PERSONAS (include in each subagent task)",
-    taskPrefixLines,
+    ...buildNativeRunnerGuide(config, participants, "debate"),
     "",
     "## PRE-ROUND STEP — Assign a Human-Readable Title",
     "",
     `Before Cycle 1, choose a concise human-readable meeting title for "${topic}" and call:`,
     `  meeting_rename({ meetingDir: "${absDir}", title: "<your concise title>" })`,
     "",
-    "Use the returned `newMeetingDir` for ALL subsequent meeting tools and subagent tasks. If rename fails, continue with the original meetingDir.",
+    "Use the returned `newMeetingDir` for ALL subsequent meeting tools. If rename fails, continue with the original meetingDir.",
+    "After renaming, replace every `<MEETING_DIR>` placeholder in the task template with the current meeting directory.",
     "",
     "## CRITICAL INSTRUCTIONS",
     "",
-    "### Blackboard-first — do NOT paste prior participant text into subagent tasks",
+    "### Blackboard-first — the blackboard is the single source of truth",
     "",
-    "The meeting blackboard is the single source of truth. Subagent tasks must direct participants to READ from the blackboard, not receive pasted history.",
+    "You never paste debate history into a participant task. Each child reads the record itself.",
     "",
-    "- Each subagent must call meeting_read_index and meeting_read_entry on the current meetingDir to read the complete debate history before writing.",
-    "- NEVER summarize or truncate the debate record when passing to subagents — tell them to read it from the blackboard.",
-    "- If the user provides feedback in chat, APPEND it to the blackboard as `speaker: \"User\", phase: \"Feedback\"`, then tell debaters to read it.",
+    "- Every debater calls meeting_read_index and meeting_read_entry on the current meetingDir to read the complete debate history before writing.",
+    "- NEVER summarize or truncate the debate record for a debater — they read it from the blackboard.",
+    '- If the user provides feedback in chat, APPEND it to the blackboard as `speaker: "User", phase: "Feedback"`, then continue the cycle.',
     "",
-    "### For subagents (include in EVERY task):",
-    "1. First, read the complete debate history from the blackboard using meeting_read_index and meeting_read_entry.",
-    "2. Write your FULL contribution using the meeting_append_entry tool with:",
-    `   - meetingDir: the current meetingDir (use the one returned by meeting_rename if rename succeeded)`,
-    "   - speaker: your display name, e.g.:",
-    agentTaskLines,
-    '   - phase: "Cycle 1", "Cycle 2", etc.',
-    "   - summary: a ONE-SENTENCE summary of your argument",
-    "   - content: your FULL argument (in the user's language, default English)",
-    "3. After writing, your FINAL ANSWER must be ONLY:",
-    "   `WROTE_ENTRY: <your one-sentence summary>`",
-    "4. DO NOT paste your full argument into the chat.",
+    "### Running a cycle",
+    "Debate is a CHAIN: each debater must see all prior entries before writing.",
+    "1. `meeting_run_cycle({ meetingDir: \"<current meetingDir>\", cycle: 1, agentName: \"<agentName>\" })` — runs ONE debater and waits for it.",
+    "2. Run it once per debater, in order, to complete cycle 1.",
+    "3. `meeting_read_index({ meetingDir })` to confirm every entry landed before judging convergence.",
     "",
-    "### For you, the facilitator:",
-    "- Do NOT paste participant full text into chat. They are on the blackboard.",
-    "- Do NOT paste prior debate history into subagent tasks. Tell subagents to read the blackboard.",
-    "- Cycle through debaters in sequence (chain mode) so each sees all prior entries.",
-    "- Read the index with meeting_read_index frequently.",
-    "- Read full entries with meeting_read_entry when synthesizing.",
-    "- After EACH full cycle (all debaters spoke once), check for CONVERGENCE:",
-    "  * Do 2+ agents agree on a specific conclusion?",
-    "  * Did the last cycle introduce any NEW arguments?",
-    "  * Did anyone explicitly concede?",
-    "- If NOT converged: run another cycle. Keep going.",
-    "- If converged: present synthesis to me.",
-    "",
-    "## FAILURE HANDLING",
-    "Subagent calls can fail (timeout, API error, model unavailable, crash). You MUST detect and handle failures:",
-    "",
-    "### Detecting failure",
-    "A subagent call has FAILED if:",
-    "- The tool result contains error text (\"error\", \"failed\", \"timeout\", \"unavailable\", \"connection\", etc.)",
-    "- The subagent returns no output or empty output",
-    "- The subagent output does NOT contain \"WROTE_ENTRY:\" (the expected success marker)",
-    "- The subagent produced no meeting_append_entry call (check with meeting_read_index after the chain step)",
-    "",
-    "### Retry strategy",
-    "When you detect a failure in a chain step:",
-    "1. Wait 5-10 seconds before retrying (API rate limits may have triggered the failure)",
-    "2. Retry the SAME debater with the SAME task up to 2 more times (3 attempts total)",
-    "3. On retry, add to the task: \"PREVIOUS ATTEMPT FAILED. This is retry N of 2. Focus only on completing your argument and writing WROTE_ENTRY.\"",
-    "4. If the debater succeeds on retry, proceed to the next debater in the chain",
-    "5. If ALL retries are exhausted, SKIP this debater for this cycle and move to the next debater",
-    "",
-    "### When a debater is UNAVAILABLE",
-    "- Do NOT wait indefinitely or freeze the session",
-    "- Skip to the next debater in the cycle",
-    "- In your structural overview, clearly mark the failed participant as: " +
-      "\"[displayName] ([agentName]): did not respond\"",
-    "- Continue the debate with remaining debaters — do NOT abort the whole debate",
-    "- If the same debater fails in 2 consecutive cycles, warn the user " +
-      "with the real display name, e.g.: \"GPT-Critic failed in 2 " +
-      "consecutive cycles; check whether that model is available\"",
-    "",
-    "### NEVER do this",
-    "- Do NOT fabricate or simulate a debater's argument",
-    "- Do NOT impose an extra manual timeout beyond the subagent tool's timeout; if the tool reports timeout, treat that attempt as failed",
-    "- Do NOT abort the entire debate because one debater failed",
-    "- Do NOT get stuck in an infinite retry loop — 3 attempts max per debater per cycle",
-    "",
+    ...failureHandlingSection("cycle", "debater"),
     "## Rules",
     "- NEVER stop at a predetermined count. Only convergence or user intervention ends this debate.",
     "- Respond in the language the user uses; default to English.",
-    "- After convergence, save transcript.md immediately and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
+    "- After convergence, save `transcript.md` immediately and, after the user confirms, `conclusion.md`.",
     "- Present: (1) the debate arc, (2) who conceded what, (3) final synthesis.",
   ].join("\n");
 }
-
 
 /**
  * Build the facilitator prompt for /brainstorm-lab (v2).
@@ -926,17 +1653,16 @@ function buildDebatePrompt(
 function buildBrainstormLabPrompt(
   topic: string,
   absDir: string,
+  config: BrainstormConfig,
   participants: ParticipantConfig[]
 ): string {
   const consultantLines = participants
     .map(
       (p) =>
-        `- **${p.displayName}**: use the ${p.agentName} subagent. ${p.brainstormRole || p.roleTitle || "Consultant"}.`
+        `- **${p.displayName}** (${p.agentName}) [${p.model ?? "inherit main model"}]: ${
+          p.brainstormRole || p.roleTitle || "Consultant"
+        } — run with meeting_run_round.`
     )
-    .join("\n");
-
-  const agentTaskLines = participants
-    .map((p) => `   - speaker: "${p.displayName}"`)
     .join("\n");
 
   return [
@@ -950,14 +1676,17 @@ function buildBrainstormLabPrompt(
     "## Consultants (3 rounds)",
     consultantLines,
     "",
+    ...buildNativeRunnerGuide(config, participants, "lab"),
+    "",
     "## PRE-ROUND STEP — Assign a Human-Readable Title",
     "",
     `Before Round 1, choose a concise human-readable meeting title for "${topic}" and call:`,
     `  meeting_rename({ meetingDir: "${absDir}", title: "<your concise title>" })`,
     "",
-    "Use the returned `newMeetingDir` for ALL subsequent meeting tools and subagent tasks. If rename fails, continue with the original meetingDir.",
+    "Use the returned `newMeetingDir` for ALL subsequent meeting tools. If rename fails, continue with the original meetingDir.",
+    "After renaming, replace every `<MEETING_DIR>` placeholder in the task template with the current meeting directory.",
     "",
-    "## V2 LAB TOOLS (in addition to meeting_append_entry/meeting_read_*)",
+    "## V2 LAB TOOLS (you, the facilitator, only — NOT the participants)",
     "",
     "You have these new tools for the artifact/graph/state system:",
     "",
@@ -968,55 +1697,56 @@ function buildBrainstormLabPrompt(
     "- **meeting_update_state**: Advance the meeting phase, round, and set the next step. Phase transitions are auto-logged as events. Phase is validated against allowed values.",
     "- **meeting_log_event**: Record important events (facilitator decisions, user feedback, errors, retries) for auditability.",
     "",
+    "The participant execution guide above explains that children only get `meeting_append_entry`, `meeting_read_index`, and `meeting_read_entry`. Do the artifact/edge/state work yourself.",
+    "",
     "## CRITICAL INSTRUCTIONS",
     "",
-    "### Blackboard-first — do NOT paste prior participant text into subagent tasks",
+    "### Blackboard-first — the blackboard is the single source of truth",
     "",
-    "The meeting blackboard is the single source of truth. Subagent tasks must direct participants to READ from the blackboard.",
+    "You never paste participant text into a participant task. `meeting_run_round` tells each child to read prior entries from the blackboard itself.",
     "",
-    "- Round 1: subagents write initial analysis. No prior entries to read.",
-    "- Round 2: tell subagents to call meeting_read_index and meeting_read_entry to read Round 1 entries.",
-    "- Round 3: tell subagents to read ALL prior round entries AND any User feedback entries.",
-    "- User feedback: append to blackboard as speaker: \"User\", phase: \"Feedback after Round N\".",
+    "- Round 1: participants write initial analysis. There are no prior entries to read.",
+    "- Round 2: children read Round 1 entries from the blackboard before responding.",
+    "- Round 3: children read ALL prior round entries AND any User feedback entries.",
+    '- User feedback: append to the blackboard first as `speaker: "User", phase: "Feedback after Round N"`.',
     "",
-    "### For subagents (include in EVERY task):",
-    "1. Read prior context from the blackboard using meeting_read_index and meeting_read_entry.",
-    "2. Write your FULL contribution using meeting_append_entry with speaker, phase, summary, and content.",
-    "3. After writing, reply ONLY with: `WROTE_ENTRY: <your one-sentence summary>`",
-    "4. DO NOT paste your full analysis into the chat.",
+    "### Running a round",
+    "1. `meeting_run_round({ meetingDir: \"<current meetingDir>\", round: 1 })` — runs every participant in parallel and returns one line per participant.",
+    "2. Rounds 2 and 3 are the same call with a higher `round`.",
+    "3. `meeting_read_index({ meetingDir })` to confirm what landed before extracting artifacts.",
     "",
     "### ARTIFACT EXTRACTION (after each round):",
     "",
     "After each round completes, YOU (the facilitator) MUST extract structured artifacts from every entry:",
     "",
     "1. Read each entry with meeting_read_entry.",
-    "2. For each Claim found: call meeting_append_artifact with type: \"claim\", the claim content, sourceEntryId, sourceEntryPath, sourceQuote (verbatim), confidence (high/medium/low), and evidenceLevel (strong/moderate/weak/none).",
-    "3. For each Question found: call meeting_append_artifact with type: \"question\", the question content, and raisedBy.",
-    "4. For each Risk identified: call with type: \"risk\", severity, and likelihood.",
-    "5. For each Evidence cited: call with type: \"evidence\", strength, and supports/opposes artifact IDs.",
-    "6. For each Decision proposed: call with type: \"decision\", rationale, blockedBy, and dependsOn.",
-    "7. For each Action item: call with type: \"action\", assignee, and priority.",
+    '2. For each Claim found: call meeting_append_artifact with type: "claim", the claim content, sourceEntryId, sourceEntryPath, sourceQuote (verbatim), confidence (high/medium/low), and evidenceLevel (strong/moderate/weak/none).',
+    '3. For each Question found: call meeting_append_artifact with type: "question", the question content, and raisedBy.',
+    '4. For each Risk identified: call with type: "risk", severity, and likelihood.',
+    '5. For each Evidence cited: call with type: "evidence", strength, and supports/opposes artifact IDs.',
+    '6. For each Decision proposed: call with type: "decision", rationale, blockedBy, and dependsOn.',
+    '7. For each Action item: call with type: "action", assignee, and priority.',
     "",
     "**Hard rules for artifacts:**",
-    "- sourceQuote MUST be a non-empty verbatim quote from the source entry.",
-    "- High-confidence claims with evidenceLevel=\"none\" are auto-marked as evidenceDebt.",
+    '- sourceQuote MUST be a non-empty verbatim quote from the source entry.',
+    '- High-confidence claims with evidenceLevel="none" are auto-marked as evidenceDebt.',
     "- Decisions with non-empty blockedBy are auto-marked as non-consensus.",
     "",
     "### EDGE CREATION (after artifact extraction):",
     "",
     "After extracting artifacts, define relationships:",
-    "- If artifact A supports B: meeting_append_edge with type: \"supports\"",
-    "- If A opposes B: meeting_append_edge with type: \"opposes\"",
-    "- If A blocks B: meeting_append_edge with type: \"blocks\"",
-    "- If A resolves B: meeting_append_edge with type: \"resolves\"",
+    '- If artifact A supports B: meeting_append_edge with type: "supports"',
+    '- If A opposes B: meeting_append_edge with type: "opposes"',
+    '- If A blocks B: meeting_append_edge with type: "blocks"',
+    '- If A resolves B: meeting_append_edge with type: "resolves"',
     "- Every edge must record creator, basis, and status.",
     "",
     "### STATE MANAGEMENT:",
     "",
     "- After each round, call meeting_update_state to advance the phase and round:",
-    "  * After Round 1: phase=\"challenge\", round=1, nextStep=\"Round 2 — challenge and refine\"",
-    "  * After Round 2: phase=\"evidence_check\", round=2, nextStep=\"Round 3 — final synthesis\"",
-    "  * After Round 3: phase=\"converge\", round=3, nextStep=\"Generate conclusion\"",
+    '  * After Round 1: phase="challenge", round=1, nextStep="Round 2 — challenge and refine"',
+    '  * After Round 2: phase="evidence_check", round=2, nextStep="Round 3 — final synthesis"',
+    '  * After Round 3: phase="converge", round=3, nextStep="Generate conclusion"',
     "- Include controllerReasoning explaining why this phase transition.",
     "- Call meeting_log_event for every facilitator decision and user feedback.",
     "",
@@ -1038,13 +1768,13 @@ function buildBrainstormLabPrompt(
     "Before launching Round 2 or Round 3, generate a CONTEXT PACK from the current state:",
     "- Call meeting_get_state to get current openQuestions, activeConflicts, acceptedDecisions.",
     "- Call meeting_read_artifacts to get relevant artifacts with source quotes.",
-    "- In each subagent's task, include a brief summary of: unresolved questions, active conflicts (who vs whom), accepted decisions, and any unaddressed risks.",
-    "- ALSO instruct subagents to read the blackboard themselves — the context pack is a navigation aid, not a replacement.",
+    "- Pass that pack to the round through `mission`: `meeting_run_round({ meetingDir, round: 2, mission: \"<context pack summary + the challenge instruction>\" })`.",
+    "- The pack is a navigation aid, not a replacement: every child still reads the blackboard itself.",
     "",
     "### HARD RULES FOR FINAL CONCLUSION:",
     "",
     "1. Every assertion in conclusion must reference an artifact ID, entry ID, AND source quote.",
-    "2. High-confidence claims with evidenceLevel=\"none\" → downgrade in conclusion, mark as evidence debt.",
+    '2. High-confidence claims with evidenceLevel="none" → downgrade in conclusion, mark as evidence debt.',
     "3. A decision blocked by unresolved risks/conflicts must NOT be written as consensus.",
     "4. Every edge in the conclusion trail must have creator, basis, and status documented.",
     "5. User feedback must be logged as an event, reflected in state, and may create new artifacts.",
@@ -1053,30 +1783,20 @@ function buildBrainstormLabPrompt(
     "",
     "Round 1: Each consultant gives initial analysis. Run in parallel.",
     "Stop after Round 1. Present your structural overview, then ASK for user feedback or permission to continue.",
-    "Round 2: only after user replies. Tell subagents to read Round 1 entries + context pack, then challenge others and improve.",
+    "Round 2: only after user replies. Run meeting_run_round({ round: 2 }) — children read Round 1 entries plus your context-pack mission, then challenge others and improve.",
     "Stop after Round 2. Present updated overview, then ASK for permission.",
-    "Round 3: only after user replies. Tell subagents to read ALL entries. Each gives FINAL recommendation, synthesizing the best ideas.",
+    "Round 3: only after user replies. Run meeting_run_round({ round: 3 }) — children read ALL entries and each gives a FINAL recommendation, synthesizing the best ideas.",
     "",
     "After Round 3, present the complete structural overview and ask whether to write the final conclusion. Only write conclusion.md after the user confirms.",
     "",
-    "## FAILURE HANDLING (same as legacy)",
-    "",
-    "Detect failures: error text, empty output, no WROTE_ENTRY, no meeting_append_entry call.",
-    "Retry: wait 5-10s, retry up to 2 more times (3 total). On retry: \"PREVIOUS ATTEMPT FAILED. This is retry N of 2.\"",
-    "If unavailable: mark as \"[displayName] ([agentName]): " +
-      "did not respond\", continue with remaining participants.",
-    "If same participant fails 2 consecutive rounds, warn user.",
-    "NEVER fabricate responses. NEVER abort session for one failure.",
-    "",
+    ...failureHandlingSection("round", "consultant"),
     "## IMPORTANT",
     "- Respond in the language the user uses; default to English.",
-    "- Save transcript.md and (after user confirms) conclusion.md per the MEETING OUTPUT PROTOCOL.",
+    "- Save `transcript.md` and, after the user confirms, `conclusion.md`.",
     "- The user can intervene at any time to steer the discussion.",
     "- Legacy /brainstorm and /debate remain available as escape hatches.",
   ].join("\n");
 }
-
-
 
 // ────────────────────────────────────────────────────────
 // Helpers
@@ -1209,8 +1929,6 @@ async function createUniqueMeetingDir(
   cwd: string,
   baseName: string
 ): Promise<{ absDir: string; meetingName: string }> {
-  const meetingsRoot = path.resolve(cwd, ".pi-meetings");
-
   // validateMeetingDir ensures root exists
   const candidates: string[] = [baseName];
   for (let suffix = 2; suffix <= 50; suffix++) {
@@ -1617,17 +2335,19 @@ function selectParticipants(
 }
 
 /**
- * Resolve configured participants (optionally filtered to a subset),
- * ensure their agent files exist, and return the ready list.
+ * Resolve configured participants (optionally filtered to a subset), verify
+ * the attached extension exists, and return the ready list plus config.
  * Notifies the user and returns null on any error.
  */
 async function prepareParticipants(
   ctx: any,
   selector?: string[]
-): Promise<ParticipantConfig[] | null> {
+): Promise<{ participants: ParticipantConfig[]; config: BrainstormConfig } | null> {
+  let config: BrainstormConfig;
   let all: ParticipantConfig[];
   try {
-    all = resolveParticipants(ctx.cwd);
+    config = loadConfig(ctx.cwd);
+    all = validateParticipants(config.participants, "participants");
   } catch (err: any) {
     ctx.ui.notify(`pi-brainstorm config error: ${err.message}`, "error");
     return null;
@@ -1643,12 +2363,23 @@ async function prepareParticipants(
     }
   }
 
-  const agentsReady = await ensureAgentsFromConfig(ctx, participants, {
-    allowGlobalWrites: !hasProjectConfig(ctx.cwd),
-  });
-  if (!agentsReady) return null;
+  const extPath = extensionAttachmentPath(config);
+  if (!fs.existsSync(extPath)) {
+    ctx.ui.notify(
+      `pi-brainstorm cannot find its extension to attach to participants: ${extPath}`,
+      "error"
+    );
+    return null;
+  }
 
-  return participants;
+  if (config.ignoredTombstones?.length) {
+    ctx.ui.notify(
+      `pi-brainstorm: ${config.ignoredTombstones.length} participant(s) disabled by config: ${config.ignoredTombstones.join(", ")}`,
+      "info"
+    );
+  }
+
+  return { participants, config };
 }
 
 /**
@@ -1660,7 +2391,8 @@ async function startSession(
   ctx: any,
   kind: SessionKind,
   topic: string,
-  participants: ParticipantConfig[]
+  participants: ParticipantConfig[],
+  config: BrainstormConfig
 ): Promise<void> {
   // Lab sessions reuse the brainstorm folder-name prefix.
   const folderKind: "brainstorm" | "debate" =
@@ -1707,7 +2439,7 @@ async function startSession(
       `🧪 Brainstorm Lab: ${meetingName}\n` +
       `  Folder: .pi-meetings/${meetingName}\n` +
       `  Artifact tracking + edges + state management active`;
-    promptText = buildBrainstormLabPrompt(topic, absDir, participants);
+    promptText = buildBrainstormLabPrompt(topic, absDir, config, participants);
   } else {
     const isBrainstorm = kind === "brainstorm";
     blackboardHeader = [
@@ -1732,8 +2464,8 @@ async function startSession(
         ? ""
         : "\n  Open-ended — runs until convergence or you intervene");
     promptText = isBrainstorm
-      ? buildBrainstormPrompt(topic, absDir, participants)
-      : buildDebatePrompt(topic, absDir, participants);
+      ? buildBrainstormPrompt(topic, absDir, config, participants)
+      : buildDebatePrompt(topic, absDir, config, participants);
   }
 
   // Seed manifest
@@ -1759,6 +2491,9 @@ async function startSession(
 
   // Start watcher
   startWatching(pi, absDir);
+
+  // Remember the roster so the run tools know who the participants are
+  activeSessions.set(absDir, { kind, topic, participants, config });
 
   ctx.ui.notify(notifyText, "info");
 
@@ -1796,10 +2531,17 @@ async function runFromFile(
     return;
   }
 
-  const participants = await prepareParticipants(ctx, session.participants);
-  if (!participants) return;
+  const prepared = await prepareParticipants(ctx, session.participants);
+  if (!prepared) return;
 
-  await startSession(pi, ctx, kind, session.topic, participants);
+  await startSession(
+    pi,
+    ctx,
+    kind,
+    session.topic,
+    prepared.participants,
+    prepared.config
+  );
 }
 
 // ────────────────────────────────────────────────────────
@@ -1924,6 +2666,13 @@ export default function (pi: ExtensionAPI) {
 
         // Start watching new dir
         startWatching(pi, targetAbsDir);
+
+        // Re-key the session roster under the new directory
+        const movedSession = activeSessions.get(oldAbsDir);
+        if (movedSession) {
+          activeSessions.delete(oldAbsDir);
+          activeSessions.set(targetAbsDir, movedSession);
+        }
 
         return {
           content: [
@@ -2223,6 +2972,157 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+
+  // ── Tool: meeting_run_round ───────────────────────────
+
+  pi.registerTool({
+    name: "meeting_run_round",
+    label: "Run Brainstorm Round",
+    description:
+      "Run one brainstorming round. Every participant runs as a headless Pi child process, in " +
+      "parallel, reads prior entries from the blackboard itself, and writes its full contribution " +
+      "with meeting_append_entry. Failures are retried inside this tool. Returns one line per " +
+      "participant with state ok | failed | timeout | unavailable. Do NOT write participant content yourself.",
+    parameters: Type.Object({
+      meetingDir: Type.String({
+        description: "Meeting directory (relative to cwd or absolute)",
+      }),
+      round: Type.Number({
+        description: `Round number (1-${MAX_BRAINSTORM_ROUNDS})`,
+      }),
+      mission: Type.Optional(
+        Type.String({
+          description: "Override the default mission text for this round",
+        })
+      ),
+      participants: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Optional subset of participant agentNames",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const absDir = validateMeetingDir(params.meetingDir, ctx.cwd);
+
+      const round = Math.floor(params.round);
+      if (!Number.isFinite(params.round) || round < 1 || round > MAX_BRAINSTORM_ROUNDS) {
+        return toolError(`round must be an integer from 1 to ${MAX_BRAINSTORM_ROUNDS}.`);
+      }
+
+      const prepared = await resolveSessionParticipants(ctx, absDir, params.participants);
+      if (!prepared.ok) return toolError(prepared.error);
+
+      const phase = `Round ${round}`;
+      const mission =
+        params.mission?.trim() ||
+        defaultMission(
+          "brainstorm",
+          "round",
+          round,
+          prepared.topic,
+          round === MAX_BRAINSTORM_ROUNDS
+        );
+
+      const outcomes = await runParticipantsParallel(
+        prepared.participants,
+        resolveMaxParallel(prepared.config),
+        (participant) =>
+          runParticipant({
+            ctx,
+            config: prepared.config,
+            participant,
+            mode: "brainstorm",
+            absDir,
+            topic: prepared.topic,
+            phase,
+            mission,
+            priorContext: round <= 1 ? "none" : "read",
+          })
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: formatOutcomes(outcomes, "round", round),
+          },
+        ],
+        details: { round, phase, participants: outcomes },
+      };
+    },
+  });
+
+  // ── Tool: meeting_run_cycle ───────────────────────────
+
+  pi.registerTool({
+    name: "meeting_run_cycle",
+    label: "Run Debate Turn",
+    description:
+      "Run ONE debater as a headless Pi child process and wait for it. Debate is a chain: call this " +
+      "once per debater per cycle so each debater reads every prior entry from the blackboard before " +
+      "writing. Failures are retried inside this tool. Do NOT write debater content yourself.",
+    parameters: Type.Object({
+      meetingDir: Type.String({
+        description: "Meeting directory (relative to cwd or absolute)",
+      }),
+      cycle: Type.Number({
+        description: "Cycle number (1 or higher)",
+      }),
+      agentName: Type.String({
+        description: "agentName of the debater to run now",
+      }),
+      mission: Type.Optional(
+        Type.String({
+          description: "Override the default mission text for this turn",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const absDir = validateMeetingDir(params.meetingDir, ctx.cwd);
+
+      const cycle = Math.floor(params.cycle);
+      if (!Number.isFinite(params.cycle) || cycle < 1) {
+        return toolError("cycle must be an integer of 1 or higher.");
+      }
+
+      const prepared = await resolveSessionParticipants(ctx, absDir, [params.agentName]);
+      if (!prepared.ok) return toolError(prepared.error);
+
+      const phase = `Cycle ${cycle}`;
+      const mission =
+        params.mission?.trim() ||
+        defaultMission("debate", "cycle", cycle, prepared.topic, false);
+      const priorEntries = await readIndexEntries(absDir);
+      const hasPriorEntries = priorEntries.length > 0;
+
+      const outcomes = await runParticipantsParallel(
+        prepared.participants,
+        1,
+        (participant) =>
+          runParticipant({
+            ctx,
+            config: prepared.config,
+            participant,
+            mode: "debate",
+            absDir,
+            topic: prepared.topic,
+            phase,
+            mission,
+            priorContext: hasPriorEntries ? "read" : "none",
+          })
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: formatOutcomes(outcomes, "cycle", cycle),
+          },
+        ],
+        details: { cycle, phase, participants: outcomes },
+      };
+    },
+  });
 
   // ── Tool: meeting_append_artifact ─────────────────────
 
@@ -2927,9 +3827,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /brainstorm <topic>", "warning");
         return;
       }
-      const participants = await prepareParticipants(ctx);
-      if (!participants) return;
-      await startSession(pi, ctx, "brainstorm", topic, participants);
+      const prepared = await prepareParticipants(ctx);
+      if (!prepared) return;
+      await startSession(
+        pi,
+        ctx,
+        "brainstorm",
+        topic,
+        prepared.participants,
+        prepared.config
+      );
     },
   });
 
@@ -2960,9 +3867,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /debate <topic>", "warning");
         return;
       }
-      const participants = await prepareParticipants(ctx);
-      if (!participants) return;
-      await startSession(pi, ctx, "debate", topic, participants);
+      const prepared = await prepareParticipants(ctx);
+      if (!prepared) return;
+      await startSession(
+        pi,
+        ctx,
+        "debate",
+        topic,
+        prepared.participants,
+        prepared.config
+      );
     },
   });
 
@@ -2996,9 +3910,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /brainstorm-lab <topic>", "warning");
         return;
       }
-      const participants = await prepareParticipants(ctx);
-      if (!participants) return;
-      await startSession(pi, ctx, "lab", topic, participants);
+      const prepared = await prepareParticipants(ctx);
+      if (!prepared) return;
+      await startSession(
+        pi,
+        ctx,
+        "lab",
+        topic,
+        prepared.participants,
+        prepared.config
+      );
     },
   });
 
@@ -3009,5 +3930,14 @@ export default function (pi: ExtensionAPI) {
     for (const dir of activeWatchers.keys()) {
       stopWatching(dir);
     }
+    for (const child of activeChildren) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Already gone.
+      }
+    }
+    activeChildren.clear();
+    activeSessions.clear();
   });
 }
